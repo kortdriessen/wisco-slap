@@ -1,0 +1,30 @@
+cat >> .gitignore <<'EOF'
+# Python/build
+__pycache__/
+*.py[cod]
+*.py[oc]
+*.egg-info/
+build/
+dist/
+wheels/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors/OS
+.DS_Store
+.vscode/
+.idea/
+
+# Envs / uv
+.venv/
+uv.lock
+EOF
+
+# notebooks for development
+nb_dev/

@@ -1,0 +1,30 @@
+[project]
+name = "wisco-slap"
+version = "0.1.0"
+description = "Analysis functions for working with SLAP2 data at the University of Wisconsin - Madison"
+readme = "README.md"
+authors = [
+    { name = "Kort Driessen", email = "driessenkort@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "slap2-py>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Build one wheel that contains both import packages.
+[tool.hatch.build.targets.wheel]
+packages = [
+  "src/wisco_slap",
+]
+
+# (Optional but nice for source distributions)
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/wisco_slap/**",
+  "README.md",
+  "pyproject.toml",
+]
