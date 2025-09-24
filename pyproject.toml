@@ -8,12 +8,22 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "slap2-py>=0.1.0",
+    "opencv-python>=4.11.0.86",
+    "black>=25.1.0",
+    "ruff>=0.13.0",
+    "ipykernel>=6.30.1",
+    "jupyterlab>=4.4.7",
+    "slap2-py",
+    "electro-py",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.sources]
+slap2-py = { path = "../slap2-py", editable = true }
+electro-py = { path = "../electro-py", editable = true }
 
 # Build one wheel that contains both import packages.
 [tool.hatch.build.targets.wheel]
@@ -28,3 +38,24 @@ include = [
   "README.md",
   "pyproject.toml",
 ]
+
+# -------------------------------- FORMATTING AND LINTING -------------------------------
+
+[tool.black]
+# Accept all Black defaults (88 col, etc.); line-length shown for clarity only.
+line-length = 88
+target-version = ["py312"]  # adjust to your project min version, e.g., "py310"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+unsafe-fixes = true
+preview = true
+
+[tool.ruff.lint]
+# Sensible, low-noise rule set; add more later as you like.
+select = ["E", "F", "I", "B", "UP"]  # pycodestyle, pyflakes, isort, bugbear, pyupgrade
+
+[tool.ruff.lint.isort]
+# Let Ruff handle import ordering; set your package name(s) here:
+known-first-party = ["package_name"]

@@ -1,17 +1,20 @@
 # plot_injection_sites.py
 # Usage: python plot_injection_sites.py /path/to/anatomy_locations.yaml
 
-import sys
 from pathlib import Path
-import yaml
+
 import matplotlib.pyplot as plt
+import yaml
 from matplotlib.patches import Rectangle
-import csc.defs as DEFS
+
+import wisco_slap.defs as DEFS
+
 
 def anat_path(subject):
     """Return path to anatomy_locations.yaml for given subject."""
-    path = f'{DEFS.data_root}/{subject}/{subject}_anatomy/anatomy_locations.yaml'
+    path = f"{DEFS.data_root}/{subject}/{subject}_anatomy/anatomy_locations.yaml"
     return Path(path)
+
 
 def load_points(yaml_path: Path):
     """Return list of (name, x, y) from a YAML file.
@@ -24,7 +27,7 @@ def load_points(yaml_path: Path):
     or:
       name: [x, y, ...]
     """
-    with open(yaml_path, "r") as f:
+    with open(yaml_path) as f:
         data = yaml.safe_load(f)
 
     points = []
@@ -42,6 +45,7 @@ def load_points(yaml_path: Path):
         )
     return points
 
+
 def plot_points_with_boxes(points, rect_w=0.3, rect_h=0.2, out_png=None, show=False):
     """Plot centers and draw centered rectangles of given size in mm."""
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -56,7 +60,9 @@ def plot_points_with_boxes(points, rect_w=0.3, rect_h=0.2, out_png=None, show=Fa
     for name, x, y in points:
         llx = x - rect_w / 2.0
         lly = y - rect_h / 2.0
-        ax.add_patch(Rectangle((llx, lly), rect_w, rect_h, fill=False, linewidth=1.0, zorder=2))
+        ax.add_patch(
+            Rectangle((llx, lly), rect_w, rect_h, fill=False, linewidth=1.0, zorder=2)
+        )
         ax.annotate(name, (x, y), textcoords="offset points", xytext=(3, 3), fontsize=8)
 
     ax.set_aspect("equal", adjustable="box")
