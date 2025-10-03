@@ -75,7 +75,7 @@ def load_exp_ephys_data(subject: str, exp: str, stores: list[str] = None):
             block_path = os.path.join(ephys_dir, block)
             store_data.append(
                 epy.tdt.io.get_data(
-                    block_path, store=store, channel=store_chans[store], dt=False
+                    block_path, store=store, channel=DEFS.store_chans[store], dt=False
                 )
             )
         data[store] = xr.concat(store_data, dim="time")
