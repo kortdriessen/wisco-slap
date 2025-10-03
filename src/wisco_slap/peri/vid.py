@@ -41,6 +41,17 @@ def detect_frame_pulses(
     return frame_times
 
 
+def record_camera_sync_mismatch(dr, n_frames, n_pulses_detected):
+    filename = "pupil_sync_mismatch.txt"
+    path = os.path.join(dr, filename)
+    if os.path.exists(path):
+        os.system(f"rm -rf {path}")
+    with open(path, "a") as f:
+        f.write(f"n_frames: {n_frames}, n_pulses_detected: {n_pulses_detected}\n")
+        f.close()
+    return
+
+
 def check_pulse_times_against_video(
     pulse_times: np.ndarray, path_to_video: str
 ) -> np.ndarray:
@@ -59,7 +70,9 @@ def check_pulse_times_against_video(
         the pulse times, adjusted to match the number of frames in the video if needed.
     """
     cap = cv2.VideoCapture(path_to_video)
+    video_dir = os.path.dirname(path_to_video)
     num_frames_true = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    record_camera_sync_mismatch(video_dir, num_frames_true, len(pulse_times))
     print(f"number of frames in video: {num_frames_true}")
     print(f"number of pulse times: {len(pulse_times)}")
     if len(pulse_times) == num_frames_true:
@@ -91,7 +104,9 @@ def check_pulse_times_against_video(
         return None
 
 
-def generate_pupil_frame_times(subject: str, exp: str, sync_block: int = 1, save=True):
+def generate_pupil_frame_times(
+    subject: str, exp: str, sync_block: int = 1, save=True, overwrite=False
+):
     """Load the camera sync pulses, detect where there were frames, and then match the pulses to the number of frames in the video
 
     Parameters
@@ -103,7 +118,7 @@ def generate_pupil_frame_times(subject: str, exp: str, sync_block: int = 1, save
     sync_block : int, optional
         the sync block number, by default 1
     save : bool, optional
-        whether to save the frame times to a file, by default True. If the file already exists, it will be overwritten.
+        whether to save the frame times to a file, by default True. If the file already exists, it will be overwritten if overwrite is True.
 
     Returns
     -------
@@ -126,7 +141,10 @@ def generate_pupil_frame_times(subject: str, exp: str, sync_block: int = 1, save
         )
         wis.util.gen.check_dir(save_dir)
         save_path = f"{save_dir}/pupil__frame_times.npy"
-        if os.path.exists(save_path):
+        if os.path.exists(save_path) and not overwrite:
+            print(f"File {save_path} already exists. Use overwrite=True to overwrite.")
+            return
+        if os.path.exists(save_path) and overwrite:
             os.system(f"rm -rf {save_path}")
         np.save(save_path, t_corrected)
     return t_corrected
