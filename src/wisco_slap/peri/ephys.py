@@ -1,7 +1,6 @@
 import os
 
 import electro_py as epy
-import numpy as np
 import xarray as xr
 
 import wisco_slap as wis
@@ -80,56 +79,3 @@ def load_exp_ephys_data(subject: str, exp: str, stores: list[str] = None):
             )
         data[store] = xr.concat(store_data, dim="time")
     return data
-
-
-def generate_ephys_scoring_data(
-    subject: str,
-    exp: str,
-    stores: list[str] = None,
-    sync_block: int = 1,
-    overwrite=False,
-):
-    """Generate and save ephys data for sleep scoring.
-
-    Parameters
-    ----------
-    subject : str
-        subject name
-    exp : str
-        experiment name
-    stores : list[str], optional
-        stores to generate data for, by default None
-    sync_block : int, optional
-        sync block number, by default 1
-    overwrite : bool, optional
-        whether to overwrite existing files, by default False
-    """
-    if stores is None:
-        stores = ["EEG_", "loal"]
-    e = load_single_ephys_block(subject, exp, stores=stores, sync_block=sync_block)
-    save_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sync_block}"
-    if os.path.exists(save_dir) and not overwrite:
-        print(f"{save_dir} directory already exists. Use overwrite=True to overwrite.")
-        return
-    wis.util.gen.check_dir(save_dir)
-    for store in stores:
-        data = e[store]
-        if "channel" in data.dims:
-            for channel in data.channel.values:
-                data_channel = data.sel(channel=channel)
-                t = data_channel["time"].values
-                d = data_channel.values
-                assert len(t) == len(d)
-                t_path = f"{save_dir}/{store}--ch{channel}_t.npy"
-                d_path = f"{save_dir}/{store}--ch{channel}_y.npy"
-                np.save(t_path, t)
-                np.save(d_path, d)
-        else:
-            t = data["time"].values
-            d = data.values
-            assert len(t) == len(d)
-            t_path = f"{save_dir}/{store}--ch0_t.npy"
-            d_path = f"{save_dir}/{store}--ch0_y.npy"
-            np.save(t_path, t)
-            np.save(d_path, d)
-    return
