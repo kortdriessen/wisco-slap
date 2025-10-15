@@ -7,6 +7,21 @@ import wisco_slap as wis
 import wisco_slap.defs as DEFS
 
 
+def regen_roi_df(subject, exp, loc, acq, roi_version="Fsvd"):
+    activity_dir = f"{DEFS.anmat_root}/{subject}/{exp}/activity_data/{loc}/{acq}"
+    wis.util.gen.check_dir(activity_dir)
+    roidf_path = f"{activity_dir}/roidf_{roi_version}.parquet"
+    if os.path.exists(roidf_path):
+        os.system(f"rm -rf {roidf_path}")
+    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    e = spy.ExSum.from_mat73(esum_path)
+    roidf = e.gen_roidf(version=roi_version)
+    roidf.write_parquet(
+        f"{DEFS.anmat_root}/{subject}/{exp}/activity_data/{loc}/{acq}/roidf_{roi_version}.parquet"
+    )
+    return
+
+
 def save_activity_dataframes(
     subject,
     exp,
