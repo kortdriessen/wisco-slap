@@ -53,7 +53,12 @@ class SourceSelector:
         self._centroids = np.asarray(centroids, dtype=float)
 
         self.fig, self.ax = plt.subplots(figsize=(10, 6))
-        im = self.ax.imshow(self.image, origin="upper", interpolation="nearest")
+        # get the vmin and vmax from the image
+        vmin = np.nanpercentile(self.image, 0)
+        vmax = np.nanpercentile(self.image, 85)
+        im = self.ax.imshow(
+            self.image, origin="upper", interpolation="nearest", vmin=vmin, vmax=vmax
+        )
         cmap = plt.get_cmap("viridis").copy()
         cmap.set_bad("white")
         im.set_cmap(cmap)
