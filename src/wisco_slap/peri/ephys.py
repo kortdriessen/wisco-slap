@@ -22,7 +22,7 @@ def get_block_paths(subject, exp):
 
 
 def load_single_ephys_block(
-    subject: str, exp: str, stores: list[str] = None, sync_block: int = 1
+    subject: str, exp: str, stores: list[str] = None, sync_block: int = 1, store_chans: dict = DEFS.store_chans
 ):
     """Load ephys data for a given experiment.
 
@@ -32,6 +32,12 @@ def load_single_ephys_block(
         subject name
     exp : str
         experiment name
+    stores : list[str], optional
+        stores to load, by default None
+    sync_block : int, optional
+        sync block number, by default 1
+    store_chans : dict, optional
+        dictionary where keys are store names and values are lists of channels to load, by default DEFS.store_chans
     """
     if stores is None:
         stores = ["EEGr", "EEG_", "loal", "Wav1"]
@@ -45,7 +51,7 @@ def load_single_ephys_block(
     block_path = os.path.join(ephys_dir, ephys_files[0])
     for store in stores:
         store_data = epy.tdt.io.get_data(
-            block_path, store=store, channel=DEFS.store_chans[store], dt=False
+            block_path, store=store, channel=store_chans[store], dt=False
         )
         data[store] = store_data
     return data

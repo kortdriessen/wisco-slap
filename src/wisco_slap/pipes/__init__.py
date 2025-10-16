@@ -9,5 +9,6 @@ from . import ref_images as ref_images
 from . import sleepscore as sleepscore
 from . import traces as traces
 from . import videos as videos
-
-__all__ = ["traces", "exp_info", "ref_images", "sleepscore", "videos"]
+from ._auto_slapscore_model_code import train_sleep_hsmm, infer_sleep_hsmm
+from . import score_mi as score_mi
+__all__ = ["traces", "exp_info", "ref_images", "sleepscore", "videos", "train_sleep_hsmm", "infer_sleep_hsmm", "score_mi"]
