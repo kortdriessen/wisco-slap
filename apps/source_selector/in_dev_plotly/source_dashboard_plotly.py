@@ -30,10 +30,10 @@ dmd = st.radio("DMD", [1, 2])
 
 
 esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
-fp = spy.utils.hfive.load_any(esum_path, f"/exptSummary/E[{dmd - 1}][0]['footprints']")
+fp = spy.hf.load_any(esum_path, f"/exptSummary/E[{dmd - 1}][0]['footprints']")
 fp = fp.swapaxes(1, 2)
 masks = fp > 0
-meanim = spy.utils.hfive.load_any(esum_path, f"/exptSummary/meanIM[{dmd - 1}][0]")
+meanim = spy.hf.load_any(esum_path, f"/exptSummary/meanIM[{dmd - 1}][0]")
 image = meanim[1, :, :].T
 
 st.write(image.shape)
