@@ -61,31 +61,32 @@ def save_activity_dataframes(
     roidf_path = f"{activity_dir}/roidf_{roi_version}.parquet"
     lsdf_path = f"{activity_dir}/lsdf_{trace_group}.parquet"
 
-    if all(
-        [
-            os.path.exists(syndf_path),
-            os.path.exists(roidf_path),
-            os.path.exists(lsdf_path),
-        ]
+    if (
+        all(
+            [
+                os.path.exists(syndf_path),
+                os.path.exists(roidf_path),
+                os.path.exists(lsdf_path),
+            ]
+        )
+        and not overwrite
     ):
-        print("All files already exist. Use overwrite=True to overwrite.")
+        print(
+            f"All files already exist for {subject} {exp} {loc} {acq}. Use overwrite=True to overwrite."
+        )
         return
-
     if synapse_trace_types is None:
         synapse_trace_types = ["matchFilt", "denoised", "events", "nonneg"]
     esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
     e = spy.ExSum.from_mat73(esum_path)
     syndf = e.gen_syndf(trace_group=trace_group, to_pull=synapse_trace_types)
-
     if os.path.exists(syndf_path) and not overwrite:
         print(f"File {syndf_path} already exists. Use overwrite=True to overwrite.")
         return
     if os.path.exists(syndf_path) and overwrite:
         os.system(f"rm -rf {syndf_path}")
     syndf.write_parquet(syndf_path)
-
     roidf = e.gen_roidf(version=roi_version)
-
     if os.path.exists(roidf_path) and not overwrite:
         print(f"File {roidf_path} already exists. Use overwrite=True to overwrite.")
         return

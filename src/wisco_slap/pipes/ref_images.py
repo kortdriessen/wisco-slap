@@ -21,7 +21,7 @@ def _get_roi_container_DEP(rois, dmd):
 
 
 def _get_roi_container(p, dmd):
-    r = spy.utils.hfive.load_any(p, f"/exptSummary/userROIs[{dmd - 1}][0]")
+    r = spy.hf.load_any(p, f"/exptSummary/userROIs[{dmd - 1}][0]")
     if type(r) is dict:
         return [r]
     else:
@@ -35,7 +35,7 @@ def save_acq_mean_images(subject, exp, loc, acq, overwrite=False, vmin=5, vmax=7
     esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
     if esum_path is None:
         return
-    # rois = spy.utils.hfive.load_any(esum_path, "/exptSummary/userROIs")
+    # rois = spy.hf.load_any(esum_path, "/exptSummary/userROIs")
     # Save each dmd meanIM
     mean_im_dir = f"{DEFS.anmat_root}/{subject}/{exp}/mean_IMs/{loc}/{acq}"
     wis.util.gen.check_dir(mean_im_dir)
@@ -46,9 +46,7 @@ def save_acq_mean_images(subject, exp, loc, acq, overwrite=False, vmin=5, vmax=7
                 f"DMD-{dmd} mean image already exists: {fname}, use overwrite=True to overwrite"
             )
             continue
-        meanim = spy.utils.hfive.load_any(
-            esum_path, f"/exptSummary/meanIM[{dmd - 1}][0]"
-        )
+        meanim = spy.hf.load_any(esum_path, f"/exptSummary/meanIM[{dmd - 1}][0]")
         img = meanim[1, :, :].T
         fh = img.shape[0] / 40
         fw = img.shape[1] / 40
@@ -183,3 +181,6 @@ def save_all_subject_ref_images(overwrite=False, vmin=5, vmax=85):
                     else:
                         continue
     return
+
+
+# save_acq_synapse_id_plots(subject, exp, loc, acq):
