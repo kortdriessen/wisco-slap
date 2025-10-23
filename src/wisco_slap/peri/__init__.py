@@ -12,4 +12,8 @@ from . import (
     vid as vid,
 )
 
-__all__ = ["ephys", "sync", "vid"]
+from . import (
+    vig as vig,
+)
+
+__all__ = ["ephys", "sync", "vid", "vig"]

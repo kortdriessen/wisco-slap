@@ -3,6 +3,7 @@ from __future__ import annotations
 # -------- Defaults (edit these) --------
 data_root: str = "/Volumes/slap_mi/slap_mi/data"
 anmat_root: str = "/Volumes/slap_mi/slap_mi/analysis_materials"
+plots_root: str = "/Volumes/slap_mi/slap_mi/analysis_materials/plots"
 
 dlc_root: str = "/Volumes/npx_nfs/slap/slap_mi_in_the_pupil"
 dlc_proj_root: str = f"{dlc_root}/dlc_slap_pupil-KD-2025-09-23"
