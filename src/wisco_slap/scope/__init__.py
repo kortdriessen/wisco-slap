@@ -8,5 +8,8 @@ from . import (
 from . import (
     anat as anat,
 )
+from . import (
+    hfio as hfio,
+)
 
-__all__ = ["anat", "act"]
+__all__ = ["anat", "act", "hfio"]
