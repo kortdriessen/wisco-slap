@@ -3,13 +3,17 @@ subpackage for dealing with data from SLAP2 microscope
 """
 
 from . import (
-    act as act,
-)
-from . import (
     anat as anat,
 )
 from . import (
-    hfio as hfio,
+    io as io,
 )
 
-__all__ = ["anat", "act", "hfio"]
+from . import (
+    act as act,
+)
+from . import (
+    somas as somas,
+)
+
+__all__ = ["anat", "io", "act", "somas"]

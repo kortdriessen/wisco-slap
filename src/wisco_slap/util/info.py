@@ -1,7 +1,10 @@
 import polars as pl
+import yaml
 
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
+import glob
+import os
 
 
 def get_unique_acquisitions_per_experiment(subject, exp):
@@ -25,3 +28,32 @@ def get_unique_acquisitions_per_experiment(subject, exp):
 def load_exp_info_spreadsheet():
     path = f"{DEFS.anmat_root}/exp_info.csv"
     return pl.read_csv(path)
+
+
+def load_dmd_info():
+    path = f"{DEFS.anmat_root}/dmd_info.yaml"
+    with open(path, "r") as f:
+        dmd_info = yaml.safe_load(f)
+    return dmd_info
+
+
+def determine_processing_done(subject, exp, loc, acq):
+    """Determine if the processing has been done for a given acquisition.
+
+    Parameters
+    ----------
+    subject : str
+        The subject ID.
+    exp : str
+        The experiment ID.
+    loc : str
+        The location ID.
+    acq : str
+        The acquisition ID.
+    """
+    data_dir = f"{DEFS.data_root}/{subject}/{exp}/{loc}/{acq}/ExperimentSummary"
+    exp_summary_files = glob.glob(os.path.join(data_dir, "*Summary-*"))
+    if len(exp_summary_files) > 0:
+        return "YES"
+    else:
+        return "NO"

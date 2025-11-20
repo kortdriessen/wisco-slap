@@ -35,7 +35,11 @@ for exp in subject_exps:
                 if os.path.exists(unlabelled_path):
                     image_path = unlabelled_path
                 else:
-                    image_path = f"{DEFS.anmat_root}/{subject}/{exp}/mean_IMs/{loc}/{acq}/DMD-{dmd}__TRIAL-000000.png"
+                    ip = f"{DEFS.anmat_root}/{subject}/{exp}/mean_IMs/{loc}/{acq}/DMD-{dmd}__TRIAL-000000__labelled.png"
+                    if os.path.exists(ip):
+                        image_path = ip
+                    else:
+                        image_path = f"{DEFS.anmat_root}/{subject}/{exp}/mean_IMs/{loc}/{acq}/DMD-{dmd}__TRIAL-000000.png"
 
             if not os.path.exists(image_path):
                 st.markdown("--------------------")

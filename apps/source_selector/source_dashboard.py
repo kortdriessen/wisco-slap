@@ -25,7 +25,7 @@ def sync_sources_to_selection(
     if trace_types is None:
         trace_types = ["matchFilt"]
     acq_id = f"{loc}--{acq}"
-    syndf = wis.scope.act.load_syndf(
+    syndf = wis.scope.io.load_syndf(
         subject,
         exp,
         loc,
@@ -126,22 +126,24 @@ else:
         f"{DEFS.anmat_root}/{subject}/{exp}/mean_IMs/{loc}/{acq}/DMD-{dmd}.png"
     )
 
-if not os.path.exists(meanim_path):
-    st.warning(
-        f"MeanIM path not found: {meanim_path}, choose a different Acquisition-ID"
-    )
-    st.stop()
-meanim_img = Image.open(meanim_path)
-st.image(meanim_img)
+# if not os.path.exists(meanim_path):
+#    st.warning(
+#        f"MeanIM path not found: {meanim_path}, choose a different Acquisition-ID"
+#    )
+#    st.stop()
+# meanim_img = Image.open(meanim_path)
+# st.image(meanim_img)
 
 # ===== Alternative way to display the actual meanIM ndarray ===========
-# f, ax = plt.subplots(1, 1, figsize=(10, 10))
-# vmin = st.slider("Image Minimum", value=0, min_value=0, max_value=100)
-# vmax = st.slider("Image Maximum", value=95, min_value=0, max_value=100)
-# v_min = np.nanpercentile(image, vmin)
-# v_max = np.nanpercentile(image, vmax)
-# ax.imshow(image, cmap="viridis", vmin=v_min, vmax=v_max)
-# st.pyplot(f)
+import matplotlib.pyplot as plt
+
+f, ax = plt.subplots(1, 1, figsize=(10, 10))
+vmin = st.slider("Image Minimum", value=0, min_value=0, max_value=100)
+vmax = st.slider("Image Maximum", value=95, min_value=0, max_value=100)
+v_min = np.nanpercentile(image, vmin)
+v_max = np.nanpercentile(image, vmax)
+ax.imshow(image, cmap="viridis", vmin=v_min, vmax=v_max)
+st.pyplot(f)
 
 
 txt_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sync_block}/scope_traces/synapses/{acq_id}/dmd{dmd}"

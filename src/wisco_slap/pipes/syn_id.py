@@ -72,8 +72,8 @@ def save_master_image_and_key(subject, exp, loc, acq, overwrite=False):
         print("Master image and key already exist, skipping...")
         return
 
-    mean_im = wis.scope.hfio.load_mean_ims(subject, exp, loc, acq)
-    fp = wis.scope.hfio.load_fprts(subject, exp, loc, acq)
+    mean_im = wis.scope.io.load_mean_ims(subject, exp, loc, acq)
+    fp = wis.scope.io.load_fprts(subject, exp, loc, acq)
     for dmd in [1, 2]:
         syns = fp[dmd]
         maps = []
@@ -118,8 +118,8 @@ def save_synapse_id_plots_and_key(
     subject, exp, loc, acq, upper_vmax_pct=95, buffer=25, channel=2, overwrite=False
 ):
     spy.plot.slap_style("im")
-    mean_im = wis.scope.hfio.load_mean_ims(subject, exp, loc, acq)
-    fp = wis.scope.hfio.load_fprts(subject, exp, loc, acq)
+    mean_im = wis.scope.io.load_mean_ims(subject, exp, loc, acq)
+    fp = wis.scope.io.load_fprts(subject, exp, loc, acq)
 
     for dmd in [1, 2]:
         save_dir = (

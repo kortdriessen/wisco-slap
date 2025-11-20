@@ -8,6 +8,7 @@ import polars as pl
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
 from wisco_slap.util.info import load_exp_info_spreadsheet
+import yaml
 
 
 def estimate_start_time(subject, exp, loc, acq):
@@ -71,28 +72,6 @@ def estimate_acq_duration(subject, exp, loc, acq):
     n_files = len(cycle_list)
     total_time = time_per_file * n_files
     return int(total_time[0] - time_per_file)
-
-
-def determine_processing_done(subject, exp, loc, acq):
-    """Determine if the processing has been done for a given acquisition.
-
-    Parameters
-    ----------
-    subject : str
-        The subject ID.
-    exp : str
-        The experiment ID.
-    loc : str
-        The location ID.
-    acq : str
-        The acquisition ID.
-    """
-    data_dir = f"{DEFS.data_root}/{subject}/{exp}/{loc}/{acq}/ExperimentSummary"
-    exp_summary_files = glob.glob(os.path.join(data_dir, "*Summary-*"))
-    if len(exp_summary_files) > 0:
-        return "YES"
-    else:
-        return "NO"
 
 
 def get_exsum_date(subject, exp, loc, acq):
@@ -168,7 +147,7 @@ def update_estimated_duration(ei, subject, exp, loc, acq):
 
 
 def update_processing_done(ei, subject, exp, loc, acq):
-    pdone = determine_processing_done(subject, exp, loc, acq)
+    pdone = wis.util.info.determine_processing_done(subject, exp, loc, acq)
     ei = ei.with_columns(
         pl.when(
             (pl.col("subject") == subject)
@@ -282,4 +261,50 @@ def update_all_subject_sync_info(redo=False):
     for subject in ei["subject"].unique():
         for exp in ei.filter(pl.col("subject") == subject)["experiment"].unique():
             wis.peri.sync.update_sync_info(subject, exp, redo=redo)
+    return
+
+
+def _update_dmd_info(subject, exp, loc, acq):
+    dmd_info_path = f"{DEFS.anmat_root}/dmd_info.yaml"
+    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    if esum_path is None:
+        print(f"{subject} {exp} {loc} {acq} has no esum path")
+        return None
+    with open(dmd_info_path, "r") as f:
+        dmd_info = yaml.safe_load(f)
+    if subject not in dmd_info:
+        dmd_info[subject] = {}
+    if exp not in dmd_info[subject]:
+        dmd_info[subject][exp] = {}
+    if loc not in dmd_info[subject][exp]:
+        dmd_info[subject][exp][loc] = {}
+    if acq not in dmd_info[subject][exp][loc]:
+        dmd_info[subject][exp][loc][acq] = {}
+    if "dmd-1" not in dmd_info[subject][exp][loc][acq]:
+        dmd_info[subject][exp][loc][acq]["dmd-1"] = {}
+        dmd_info[subject][exp][loc][acq]["dmd-1"]["depth"] = -1
+    if "dmd-2" not in dmd_info[subject][exp][loc][acq]:
+        dmd_info[subject][exp][loc][acq]["dmd-2"] = {}
+        dmd_info[subject][exp][loc][acq]["dmd-2"]["depth"] = -1
+    for dmd in [1, 2]:
+        roi = wis.pipes.annotation_materials._get_roi_container(esum_path, dmd)
+        if roi[0] == 0:
+            dmd_info[subject][exp][loc][acq]["dmd-{}".format(dmd)]["somas"] = []
+        else:
+            roi_names = []
+            for r in roi:
+                roi_names.append(r["Label"])
+            dmd_info[subject][exp][loc][acq]["dmd-{}".format(dmd)]["somas"] = roi_names
+    with open(dmd_info_path, "w") as f:
+        yaml.dump(dmd_info, f)
+
+
+def update_dmd_info():
+    si = wis.peri.sync.load_sync_info()
+    for subject in si.keys():
+        for exp in si[subject].keys():
+            acqs = wis.util.info.get_unique_acquisitions_per_experiment(subject, exp)
+            for a in acqs:
+                loc, acq = a.split("--")
+                _update_dmd_info(subject, exp, loc, acq)
     return

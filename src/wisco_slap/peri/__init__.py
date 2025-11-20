@@ -13,7 +13,7 @@ from . import (
 )
 
 from . import (
-    vig as vig,
+    anno as anno,
 )
 
-__all__ = ["ephys", "sync", "vid", "vig"]
+__all__ = ["ephys", "sync", "vid", "anno"]

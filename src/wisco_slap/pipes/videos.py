@@ -65,6 +65,9 @@ def _save_eye_metric_df(subject, exp, sb, redo=False):
 def _save_full_exp_eye_dfs(subject, exp, redo=False):
     si = wis.peri.sync.load_sync_info()
     for sb in si[subject][exp]["sync_blocks"].keys():
+        wis.pipes.sleepscore._detect_and_save_pupil_frame_times(
+            subject, exp, sb, overwrite=False
+        )
         _save_eye_metric_df(subject, exp, sb, redo=redo)
     return
 

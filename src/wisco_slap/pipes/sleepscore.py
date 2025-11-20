@@ -371,18 +371,29 @@ def save_whisking_traces_for_scoring_all_subjects(overwrite=False):
     return
 
 
-def full_peripheral_scoring_data_pipeline(overwrite=False):
+def all_subjects_full_peripheral_scoring_data_pipeline(overwrite=False):
     save_ephys_and_frame_times_all_subjects(overwrite=overwrite)
     save_eye_traces_for_scoring_all_subjects(overwrite=overwrite)
     save_whisking_traces_for_scoring_all_subjects(overwrite=overwrite)
     return
 
 
+def save_peripheral_scoring_data(subject, exp, overwrite=False):
+    si = wis.peri.sync.load_sync_info()
+    for sb in si[subject][exp]["sync_blocks"].keys():
+        _save_ephys_and_frame_times_for_scoring(subject, exp, sb, overwrite=overwrite)
+        _save_eye_traces_for_scoring(subject, exp, sb, overwrite=overwrite)
+        _save_whisking_traces_for_scoring(subject, exp, sb, overwrite=overwrite)
+    return
+
+
 def write_roi_traces_for_scoring(
-    subject, exp, loc, acq, roi_version="Fsvd", roi_channel=1
+    subject, exp, loc, acq, roi_version="Fsvd", roi_channel=1, overwrite=False
 ):
-    roidf = wis.scope.act.load_roidf(subject, exp, loc, acq, roi_version=roi_version)
-    act_key = f"roi_ch{roi_channel}"
+    roidf = wis.scope.io.load_roidf(
+        subject, exp, loc, acq, roi_version=roi_version, channel=roi_channel
+    )
+    act_key = f"data"
     acq_id = f"{loc}--{acq}"
     si = wis.peri.sync.load_sync_info()
     ephys_offset = si[subject][exp]["acquisitions"][acq_id]["ephys_offset"]
@@ -392,13 +403,130 @@ def write_roi_traces_for_scoring(
     locletter = loc.split("_")[1]
     acqnumber = acq.split("_")[1]
     for dmd in [1, 2]:
-        dmd_df = roidf.filter(pl.col("DMD") == dmd)
+        dmd_df = roidf.filter(pl.col("dmd") == dmd)
         if len(dmd_df) == 0:
             continue
-        for roi in dmd_df["roi_name"].unique():
-            roi_df = dmd_df.filter(pl.col("roi_name") == roi)
+        for roi in dmd_df["soma-ID"].unique():
+            data_path = f"{save_dir}/{locletter}{acqnumber}{roi}-dmd{dmd}_y.npy"
+            t_path = f"{save_dir}/{locletter}{acqnumber}{roi}-dmd{dmd}_t.npy"
+            if os.path.exists(data_path) and os.path.exists(t_path) and not overwrite:
+                continue
+            elif os.path.exists(data_path) and os.path.exists(t_path) and overwrite:
+                os.system(f"rm -rf {data_path}")
+                os.system(f"rm -rf {t_path}")
+            roi_df = dmd_df.filter(pl.col("soma-ID") == roi)
             roi_data = roi_df[act_key].to_numpy()
             roi_times = roi_df["time"].to_numpy() + ephys_offset
-            np.save(f"{save_dir}/{locletter}{acqnumber}{roi}-dmd{dmd}_y.npy", roi_data)
-            np.save(f"{save_dir}/{locletter}{acqnumber}{roi}-dmd{dmd}_t.npy", roi_times)
+            np.save(data_path, roi_data)
+            np.save(t_path, roi_times)
+    return
+
+
+def write_roi_traces_for_scoring_all_subjects(overwrite=False):
+    si = wis.peri.sync.load_sync_info()
+    for subject in si.keys():
+        for exp in si[subject].keys():
+            acq_ids = wis.util.info.get_unique_acquisitions_per_experiment(subject, exp)
+            for acq_id in acq_ids:
+                loc, acq = acq_id.split("--")
+                try:
+                    write_roi_traces_for_scoring(
+                        subject, exp, loc, acq, overwrite=overwrite
+                    )
+                except Exception as e:
+                    print(
+                        f"Error writing ROI traces for {subject} {exp} {loc} {acq}: {e}"
+                    )
+                    continue
+    return
+
+
+def save_glutamate_sums_for_scoring(
+    subject, exp, loc, acq, min_sources=10, overwrite=False
+):
+    sb = wis.peri.sync.get_acq_sync_block(subject, exp, loc, acq)
+    sum_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/scope_traces/synapses/{loc}--{acq}/glutamate_sums"
+    if os.path.exists(sum_dir) and not overwrite:
+        # make sure the dir is not empty
+        if len(os.listdir(sum_dir)) > 0:
+            print(
+                f"Glutamate sums already exist: {sum_dir}, use overwrite=True to overwrite"
+            )
+            return
+    else:
+        os.system(f"rm -rf {sum_dir}")
+        wis.util.gen.check_dir(sum_dir)
+
+    df = wis.scope.io.load_syndf(subject, exp, loc, acq, apply_ephys_offset=True)
+    df = df.with_columns((pl.col("noise") * 5).alias("sd5"))
+    df = df.with_columns(
+        pl.when(pl.col("data") > pl.col("sd5"))
+        .then(pl.lit(True))
+        .otherwise(pl.lit(False))
+        .alias("active")
+    )
+    wis.util.gen.check_dir(sum_dir)
+    min_sources = 10
+    if "soma-ID" not in df.columns:
+        raise ValueError(
+            f"soma-ID column not found in df for {subject} {exp} {loc} {acq}"
+        )
+    for sid in df["soma-ID"].unique():
+        if "unidentifiable" in sid:
+            continue
+        d = df.filter(pl.col("soma-ID") == sid)
+        n_unique_combinations = d.select(["dmd", "source-ID"]).n_unique()
+        if n_unique_combinations < min_sources:
+            continue
+        glut_sums = d.group_by("time").agg(pl.sum("data"))
+        glut_sums = glut_sums.sort("time")
+        data = glut_sums["data"].to_numpy()
+        time = glut_sums["time"].to_numpy()
+        name = f"{sid}-{n_unique_combinations}"
+        np.save(f"{sum_dir}/{name}_y.npy", data)
+        np.save(f"{sum_dir}/{name}_t.npy", time)
+
+    sum_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/scope_traces/synapses/{loc}--{acq}/glutamate_sums/fracactive"
+    wis.util.gen.check_dir(sum_dir)
+
+    for sid in df["soma-ID"].unique():
+        if "unidentifiable" in sid:
+            continue
+        d = df.filter(pl.col("soma-ID") == sid)
+        n_unique_combinations = d.select(["dmd", "source-ID"]).n_unique()
+        if n_unique_combinations < min_sources:
+            continue
+        glut_sums = d.group_by("time").agg(pl.sum("active"))
+        glut_sums = glut_sums.sort("time")
+        data = glut_sums["active"].to_numpy()
+        data = (data / n_unique_combinations) * 100
+        time = glut_sums["time"].to_numpy()
+        name = f"{sid}-{n_unique_combinations}"
+        np.save(f"{sum_dir}/{name}_y.npy", data)
+        np.save(f"{sum_dir}/{name}_t.npy", time)
+
+
+def save_glutamate_sums_all_subjects(overwrite=False):
+    si = wis.peri.sync.load_sync_info()
+    for subject in si.keys():
+        for exp in si[subject].keys():
+            acq_ids = wis.util.info.get_unique_acquisitions_per_experiment(subject, exp)
+            for acq_id in acq_ids:
+                try:
+                    print(f"Working on {subject} {exp} {acq_id}")
+                    loc, acq = acq_id.split("--")
+                    save_glutamate_sums_for_scoring(
+                        subject, exp, loc, acq, overwrite=overwrite
+                    )
+                except Exception as e:
+                    print(
+                        f"Error saving glutamate sums for {subject} {exp} {loc} {acq}: {e}"
+                    )
+                    continue
+
+
+def full_scoring_data_pipeline(subject, exp, loc, acq, overwrite=False):
+    save_peripheral_scoring_data(subject, exp, overwrite=overwrite)
+    write_roi_traces_for_scoring(subject, exp, loc, acq, overwrite=overwrite)
+    save_glutamate_sums_for_scoring(subject, exp, loc, acq, overwrite=overwrite)
     return

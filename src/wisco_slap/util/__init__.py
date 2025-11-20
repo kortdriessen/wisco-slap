@@ -14,5 +14,8 @@ from . import (
 from . import (
     video as video,
 )
+from . import (
+    plot as plot,
+)
 
-__all__ = ["gen", "io", "video", "info"]
+__all__ = ["gen", "io", "video", "info", "plot"]

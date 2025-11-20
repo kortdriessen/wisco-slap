@@ -120,9 +120,7 @@ def save_activity_dataframes_all_subjects(overwrite=False, max_dur=None):
                 ):
                     print(f"Saving activity dataframes for {subject} {exp} {loc} {acq}")
                     if (
-                        wis.pipes.exp_info.determine_processing_done(
-                            subject, exp, loc, acq
-                        )
+                        wis.util.info.determine_processing_done(subject, exp, loc, acq)
                         == "NO"
                     ):
                         print(

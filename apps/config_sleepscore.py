@@ -78,7 +78,7 @@ if include_synapses:
     synapse_trace_type = "matchFilt"
     trace_group = "dF"
     loc, acq = acq_id.split("--")
-    syndf = wis.scope.act.load_syndf(subject, exp, loc, acq, trace_group=trace_group)
+    syndf = wis.scope.io.load_syndf(subject, exp, loc, acq, trace_group=trace_group)
     ephys_offset = si[subject][exp]["acquisitions"][acq_id]["ephys_offset"]
     if st.button("Generate Synapse Traces"):
         for dmd in [1, 2]:

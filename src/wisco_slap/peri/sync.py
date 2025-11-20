@@ -143,6 +143,12 @@ def load_sync_info():
     return si
 
 
+def get_acq_sync_block(subject, exp, loc, acq):
+    si = load_sync_info()
+    key = f"{loc}--{acq}"
+    return si[subject][exp]["acquisitions"][key]["sync_block"]
+
+
 def get_ephys_coverage(subject, exp):
     coverages = {}
 
