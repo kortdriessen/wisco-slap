@@ -87,7 +87,7 @@ def get_exsum_date(subject, exp, loc, acq):
 
 
 def get_refstack_used(subject, exp, loc, acq):
-    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     if esum_path is None:
         return None
     with h5py.File(esum_path, "r") as f:
@@ -98,7 +98,7 @@ def get_refstack_used(subject, exp, loc, acq):
 
 
 def get_analyze_hz(subject, exp, loc, acq):
-    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     if esum_path is None:
         return None
     with h5py.File(esum_path, "r") as f:
@@ -107,7 +107,7 @@ def get_analyze_hz(subject, exp, loc, acq):
 
 
 def get_draw_user_rois(subject, exp, loc, acq):
-    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     if esum_path is None:
         return None
     with h5py.File(esum_path, "r") as f:
@@ -266,7 +266,7 @@ def update_all_subject_sync_info(redo=False):
 
 def _update_dmd_info(subject, exp, loc, acq):
     dmd_info_path = f"{DEFS.anmat_root}/dmd_info.yaml"
-    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     if esum_path is None:
         print(f"{subject} {exp} {loc} {acq} has no esum path")
         return None

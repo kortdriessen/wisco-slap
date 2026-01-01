@@ -390,6 +390,10 @@ def save_peripheral_scoring_data(subject, exp, overwrite=False):
 def write_roi_traces_for_scoring(
     subject, exp, loc, acq, roi_version="Fsvd", roi_channel=1, overwrite=False
 ):
+    # raise an error that this function is deprecated and use write_roi_dff_traces_for_scoring instead
+    raise ValueError(
+        "This function is deprecated and use write_roi_dff_traces_for_scoring instead"
+    )
     roidf = wis.scope.io.load_roidf(
         subject, exp, loc, acq, roi_version=roi_version, channel=roi_channel
     )
@@ -419,6 +423,38 @@ def write_roi_traces_for_scoring(
             roi_times = roi_df["time"].to_numpy() + ephys_offset
             np.save(data_path, roi_data)
             np.save(t_path, roi_times)
+    return
+
+
+def write_roi_dff_traces_for_scoring(
+    subject, exp, loc, acq, roi_version="Fsvd", roi_channel=1, overwrite=False
+):
+    roidf = wis.scope.io.load_roidf(
+        subject, exp, loc, acq, roi_version=roi_version, channel=roi_channel
+    )
+    dff, evdf = wis.scope.somas.detect_CaEvents(roidf)
+    act_key = f"dff"
+    acq_id = f"{loc}--{acq}"
+    si = wis.peri.sync.load_sync_info()
+    ephys_offset = si[subject][exp]["acquisitions"][acq_id]["ephys_offset"]
+    sync_block = si[subject][exp]["acquisitions"][acq_id]["sync_block"]
+    save_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sync_block}/scope_traces/soma_rois/{acq_id}/dff"
+    wis.util.gen.check_dir(save_dir)
+    locletter = loc.split("_")[1]
+    acqnumber = acq.split("_")[1]
+    for roi in dff["soma-ID"].unique():
+        data_path = f"{save_dir}/{locletter}{acqnumber}{roi}_y.npy"
+        t_path = f"{save_dir}/{locletter}{acqnumber}{roi}_t.npy"
+        if os.path.exists(data_path) and os.path.exists(t_path) and not overwrite:
+            continue
+        elif os.path.exists(data_path) and os.path.exists(t_path) and overwrite:
+            os.system(f"rm -rf {data_path}")
+            os.system(f"rm -rf {t_path}")
+        roi_df = dff.filter(pl.col("soma-ID") == roi)
+        roi_data = roi_df[act_key].to_numpy()
+        roi_times = roi_df["time"].to_numpy() + ephys_offset
+        np.save(data_path, roi_data)
+        np.save(t_path, roi_times)
     return
 
 
@@ -527,6 +563,56 @@ def save_glutamate_sums_all_subjects(overwrite=False):
 
 def full_scoring_data_pipeline(subject, exp, loc, acq, overwrite=False):
     save_peripheral_scoring_data(subject, exp, overwrite=overwrite)
-    write_roi_traces_for_scoring(subject, exp, loc, acq, overwrite=overwrite)
+    write_roi_dff_traces_for_scoring(subject, exp, loc, acq, overwrite=overwrite)
     save_glutamate_sums_for_scoring(subject, exp, loc, acq, overwrite=overwrite)
     return
+
+
+def save_matrix_arrays_for_viewer(subject, exp, loc, acq, soma_id, snr_thresh=5):
+    """
+    Save matrix arrays for a given subject, experiment, location, and acquisition.
+    """
+    idf = wis.scope.io.load_synid_labels(subject, exp, loc, acq)
+    dend_ids = idf.filter(pl.col("soma-ID") == soma_id)["dend-ID"].unique().to_numpy()
+    dend_ids = dend_ids[dend_ids != None]
+    dend_ids = np.sort(dend_ids)
+    syn_orders = wis.scope.syn_topo.load_syn_orders(subject, exp, loc, acq)
+    bdf = wis.scope.io.load_bayes_ev_df(subject, exp, loc, acq)
+    idf_d = idf.select(["dend-ID", "source-ID", "dmd"])
+    bdf = bdf.join(idf_d, on=["dmd", "source-ID"], how="left")
+    bdf = bdf.sort("time")
+    bdf = bdf.filter(pl.col("mfsnr") > snr_thresh)
+    dmd_colors = []
+    si = wis.peri.sync.load_sync_info()
+    for dend in dend_ids:
+        dend_dmd = idf.filter(pl.col("dend-ID") == dend)["dmd"].unique().to_numpy()
+        bdf_dend = bdf.filter(pl.col("dend-ID") == dend)
+        dend_order = syn_orders[dend]
+        syn_vals_raw = bdf_dend["source-ID"].to_numpy()
+        sb = si[subject][exp]["acquisitions"][f"{loc}--{acq}"]["sync_block"]
+        root = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/glut_events/{loc}--{acq}"
+        wis.util.gen.check_dir(root)
+
+        # Map each value in syn_vals_raw to its index position in dend_order
+        order_map = {source_id: idx for idx, source_id in enumerate(dend_order)}
+        syn_vals = np.array([order_map[s] for s in syn_vals_raw])
+        t_vals = bdf_dend["time"].to_numpy()
+        snr_vals = bdf_dend["mfsnr"].to_numpy()
+        # normalize snr_vals so that all values are between 0.3 and 1
+        snr_vals = (snr_vals - snr_vals.min()) / (snr_vals.max() - snr_vals.min())
+        snr_vals = snr_vals * 0.7 + 0.3
+
+        ephys_offset = si[subject][exp]["acquisitions"][f"{loc}--{acq}"]["ephys_offset"]
+        t_vals = t_vals + ephys_offset
+
+        # save the 3 major arrays
+        np.save(f"{root}/{dend}_y.npy", syn_vals)
+        np.save(f"{root}/{dend}_t.npy", t_vals)
+        np.save(f"{root}/{dend}_snr.npy", snr_vals)
+        if dend_dmd == 1:
+            dmd_color = "#ff0dd7"
+        else:
+            dmd_color = "#42f551"
+        dmd_colors.append(dmd_color)
+    dmd_colors = np.array(dmd_colors)
+    np.save(f"{root}/dmd_colors.npy", dmd_colors)

@@ -12,7 +12,7 @@ def regen_roi_df(subject, exp, loc, acq, roi_version="Fsvd"):
     roidf_path = f"{activity_dir}/roidf_{roi_version}.parquet"
     if os.path.exists(roidf_path):
         os.system(f"rm -rf {roidf_path}")
-    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     e = spy.ExSum.from_mat73(esum_path)
     roidf = e.gen_roidf(version=roi_version)
     roidf.write_parquet(
@@ -76,7 +76,7 @@ def save_activity_dataframes(
         return
     if synapse_trace_types is None:
         synapse_trace_types = ["matchFilt", "denoised", "events", "nonneg"]
-    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     e = spy.ExSum.from_mat73(esum_path)
     syndf = e.gen_syndf(trace_group=trace_group, to_pull=synapse_trace_types)
     if os.path.exists(syndf_path) and not overwrite:

@@ -8,14 +8,5 @@ from . import (
 from . import (
     info as info,
 )
-from . import (
-    io as io,
-)
-from . import (
-    video as video,
-)
-from . import (
-    plot as plot,
-)
 
-__all__ = ["gen", "io", "video", "info", "plot"]
+__all__ = ["gen", "info"]

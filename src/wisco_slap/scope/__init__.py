@@ -16,4 +16,13 @@ from . import (
     somas as somas,
 )
 
-__all__ = ["anat", "io", "act", "somas"]
+from .DF_Classes import (
+    SynDF,
+    SomaDF,
+)
+
+from . import (
+    syn_topo as syn_topo,
+)
+
+__all__ = ["anat", "io", "act", "somas", "SynDF", "SomaDF", "syn_topo"]

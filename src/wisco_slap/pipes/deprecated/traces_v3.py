@@ -67,7 +67,7 @@ def gen_and_save_all_activity_dfs(
     f0df_path = all_paths[4]
 
     wis.util.gen.check_dir(os.path.dirname(df_path))
-    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     eset = spy.ExSum.from_mat73(esum_path)
 
     if os.path.exists(df_path):
@@ -145,7 +145,7 @@ def gen_and_save_activity_dfs_all_subjects(overwrite=False):
                 try:
                     print(f"Working on {subject} {exp} {acq_id}")
                     loc, acq = acq_id.split("--")
-                    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+                    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
                     if esum_path is None:
                         continue
                     gen_and_save_all_activity_dfs(

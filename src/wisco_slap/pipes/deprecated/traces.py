@@ -81,7 +81,7 @@ def load_synid_labels(subject, exp, loc, acq):
 
 
 def create_full_activity_dfs(subject, exp, loc, acq):
-    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     eset = spy.hf.io.load_full_Eset_all_dmds(esum_path, exclude_fields=["footprints"])
     fs = spy.hf.load_any(esum_path, "/exptSummary/params/analyzeHz")
     fs = float(fs[0][0])
@@ -376,7 +376,7 @@ def gen_and_save_activity_dfs_all_subjects(overwrite=False):
                 try:
                     print(f"Working on {subject} {exp} {acq_id}")
                     loc, acq = acq_id.split("--")
-                    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+                    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
                     if esum_path is None:
                         continue
                     _gen_and_save_activity_dfs(

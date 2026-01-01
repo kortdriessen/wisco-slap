@@ -332,14 +332,15 @@ def detect_calcium_events(
 def detect_CaEvents(roidf):
     evdfs = []
     dffs = []
-    for soma_id in roidf["roi_name"].unique():
-        sdf = roidf.filter(pl.col("roi_name") == soma_id).sort("time")
-        data = sdf["roi_ch1"].to_numpy()
+    for soma_id in roidf["soma-ID"].unique():
+        print(f"Detecting CaEvents for soma {soma_id}")
+        sdf = roidf.filter(pl.col("soma-ID") == soma_id).sort("time")
+        data = sdf["data"].to_numpy()
         time = sdf["time"].to_numpy()
         dres = detect_calcium_events(data, time)
         evdf = pl.DataFrame(dres.events)
-        evdf = evdf.with_columns(pl.lit(soma_id).alias("roi_name"))
-        dff = pl.DataFrame({"dff": dres.dff, "roi_name": soma_id, "time": time})
+        evdf = evdf.with_columns(pl.lit(soma_id).alias("soma-ID"))
+        dff = pl.DataFrame({"dff": dres.dff, "soma-ID": soma_id, "time": time})
         evdfs.append(evdf)
         dffs.append(dff)
     evdf = pl.concat(evdfs)

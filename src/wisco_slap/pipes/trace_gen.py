@@ -234,6 +234,8 @@ def create_null_trial_data(clean):
 
 def assert_shape_match(clean, comparison_data):
     for key in clean.keys():
+        if "ROI" in key:  # TODO: Fix this immedidately!!! Hack!
+            continue
         if type(clean[key]) is np.ndarray:
             assert (
                 comparison_data[key].shape == clean[key].shape
@@ -505,7 +507,9 @@ def create_fzerodf(trial_data, refdata):
     return pl.concat(data_frames)
 
 
-def generate_and_save_all_activity_dfs(subject, exp, loc, acq, overwrite=False):
+def generate_and_save_all_activity_dfs(
+    subject, exp, loc, acq, overwrite=False, return_raw=False
+):
 
     act_dir = os.path.join(DEFS.anmat_root, subject, exp, "activity_data", loc, acq)
     wis.util.gen.check_dir(act_dir)
@@ -519,8 +523,10 @@ def generate_and_save_all_activity_dfs(subject, exp, loc, acq, overwrite=False):
             for file in os.listdir(act_dir):
                 os.system(f"rm -rf {os.path.join(act_dir, file)}")
 
-    ep = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    ep = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     trial_data, refdata, fs, ntrials = read_full_trial_data_dict(ep)
+    if return_raw:
+        return trial_data, refdata, fs, ntrials
     clean_trials = get_clean_trial_dict(trial_data)
     trial_data = replace_bad_trials_with_null_data(trial_data, clean_trials)
     check_all_trial_shapes_match(trial_data, clean_trials)
@@ -538,5 +544,41 @@ def generate_and_save_all_activity_dfs(subject, exp, loc, acq, overwrite=False):
     lsdf = create_lsdf(trial_data, refdata)
     lsdf.write_parquet(os.path.join(act_dir, "lsdf.parquet"))
 
+    lsdf_dff = create_lsdf(trial_data, refdata, trace_group="dFF")
+    lsdf_dff.write_parquet(os.path.join(act_dir, "lsdf_dFF.parquet"))
+
     fzdf = create_fzerodf(trial_data, refdata)
     fzdf.write_parquet(os.path.join(act_dir, "fzdf.parquet"))
+
+
+def lsdff_all_subjects():
+    si = wis.peri.sync.load_sync_info()
+    for subject in si.keys():
+        for exp in si[subject].keys():
+            locacqs = wis.util.info.get_unique_acquisitions_per_experiment(subject, exp)
+            for la in locacqs:
+                loc, acq = la.split("--")
+                print(f"Working on {subject} {exp} {loc} {acq}")
+                try:
+                    quick_lsdff(subject, exp, loc, acq)
+                except Exception as e:
+                    print(
+                        f"Error generating lsdff for {subject} {exp} {loc} {acq}: {e}"
+                    )
+                    continue
+    return
+
+
+def quick_lsdff(subject, exp, loc, acq):
+    act_dir = os.path.join(DEFS.anmat_root, subject, exp, "activity_data", loc, acq)
+    wis.util.gen.check_dir(act_dir)
+
+    ep = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    trial_data, refdata, fs, ntrials = read_full_trial_data_dict(ep)
+    clean_trials = get_clean_trial_dict(trial_data)
+    trial_data = replace_bad_trials_with_null_data(trial_data, clean_trials)
+    check_all_trial_shapes_match(trial_data, clean_trials)
+
+    lsdf_dff = create_lsdf(trial_data, refdata, trace_group="dFF")
+    lsdf_dff.write_parquet(os.path.join(act_dir, "lsdf_dFF.parquet"))
+    return

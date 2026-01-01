@@ -1922,13 +1922,19 @@ def generate_standard_synaptic_movies(
 
     # Load the soma df and roi_map:
     somadf = wis.scope.io.load_roidf(
-        subject, exp, loc, acq, apply_ephys_offset=True, roi_version=soma_type
+        subject,
+        exp,
+        loc,
+        acq,
+        apply_ephys_offset=True,
+        channel=1,
+        roi_version=soma_type,
     )
     dff, evdf = wis.scope.somas.detect_CaEvents(somadf)
     soma_cut = somadf.filter(pl.col("time").is_between(t1, t2)).filter(
-        pl.col("roi_name").is_in(real_somas)
+        pl.col("soma-ID").is_in(real_somas)
     )
-    soma_cut = soma_cut.sort(["roi_name", "time"])
+    soma_cut = soma_cut.sort(["soma-ID", "time"])
 
     soma_traces = []
     traces_to_animate = []
@@ -1937,7 +1943,7 @@ def generate_standard_synaptic_movies(
     roi_events = []
     for soma in real_somas:
         soma_dff = (
-            dff.filter(pl.col("roi_name") == soma)
+            dff.filter(pl.col("soma-ID") == soma)
             .filter(pl.col("time").is_between(t1, t2))["dff"]
             .to_numpy()
         )
@@ -1947,7 +1953,7 @@ def generate_standard_synaptic_movies(
         soma_traces.append(soma_trace_raw)
 
         roi_evdf = (
-            evdf.filter(pl.col("roi_name") == soma)
+            evdf.filter(pl.col("soma-ID") == soma)
             .filter(pl.col("peak_time").is_between(t1, t2))["peak_time"]
             .to_numpy()
         )
@@ -1984,13 +1990,13 @@ def generate_standard_synaptic_movies(
         d2 = syndf.filter(pl.col("dmd") == dmd).filter(
             pl.col("time").is_between(t1, t2)
         )
-        d2 = d2.sort(["source", "time"])
-        time_array = d2.filter(pl.col("source") == 1)["time"].to_numpy()
+        d2 = d2.sort(["source-ID", "time"])
+        time_array = d2.filter(pl.col("source-ID") == 1)["time"].to_numpy()
         time_array = time_array[::10]
 
         dat = []
-        for source_id in d2["source"].unique().sort().to_list():
-            d2_source = d2.filter(pl.col("source") == source_id)["snr"].to_numpy()
+        for source_id in d2["source-ID"].unique().sort().to_list():
+            d2_source = d2.filter(pl.col("source-ID") == source_id)["snr"].to_numpy()
             d2_source = d2_source[::10]
             # replace nan with 0
             d2_source = np.nan_to_num(d2_source)
@@ -2171,3 +2177,16 @@ def generate_peripheral_trace_movie(
     save_path = os.path.join(save_to, "peripheral_frame_times.npy")
     np.save(save_path, time_array)
     return
+
+
+def make_full_syn_movies(subject, exp, loc, acq, t1=None, t2=None, out_dir="full"):
+    # check if movie already exists:
+    movie_dir = os.path.join(
+        DEFS.anmat_root, "plots", "movies", subject, exp, loc, acq, out_dir
+    )
+    if os.path.exists(movie_dir):
+        if len(os.listdir(movie_dir)) > 0:
+            return
+    generate_standard_synaptic_movies(
+        subject, exp, loc, acq, t1=t1, t2=t2, out_dir=out_dir
+    )

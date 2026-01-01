@@ -44,7 +44,7 @@ def save_acq_mean_images(subject, exp, loc, acq, overwrite=False, vmin=5, vmax=7
     plt.style.use("dark_background")
     if wis.util.info.determine_processing_done(subject, exp, loc, acq) == "NO":
         return
-    esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
     if esum_path is None:
         return
     # rois = spy.hf.load_any(esum_path, "/exptSummary/userROIs")

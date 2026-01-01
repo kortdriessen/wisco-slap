@@ -9,17 +9,10 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "opencv-python>=4.11.0.86",
-    "black>=25.1.0",
-    "ruff>=0.13.0",
-    "ipykernel>=6.30.1",
-    "jupyterlab>=4.4.7",
     "slap2-py",
     "electro-py",
     "tqdm>=4.67.1",
     "rich>=14.1.0",
-    "ipympl>=0.9.7",
-    "ipywidgets>=8.1.7",
-    "streamlit>=1.50.0",
     "pillow>=11.3.0",
     "scikit-learn>=1.7.2",
     "python-pptx>=1.0.2",
@@ -29,6 +22,20 @@ dependencies = [
     "h5py>=3.14.0",
     "hdf5storage>=0.2.2",
     "mat73>=0.65",
+    "cvxpy>=1.7.3",
+    "streamlit>=1.50.0",
+]
+
+# Dev-only deps: tools + notebooks.
+# uv supports groups; install with: uv sync --group dev
+[dependency-groups]
+dev = [
+    "ruff>=0.13.0",
+    "ty>=0.0.8",
+    "ipykernel>=6.30.1",
+    "jupyterlab>=4.4.7",
+    "ipympl>=0.9.7",
+    "ipywidgets>=8.1.7",
 ]
 
 [build-system]
@@ -39,7 +46,7 @@ build-backend = "hatchling.build"
 slap2-py = { path = "../slap2-py", editable = true }
 electro-py = { path = "../electro-py", editable = true }
 
-# Build one wheel that contains both import packages.
+# Build one wheel that contains the import package.
 [tool.hatch.build.targets.wheel]
 packages = [
   "src/wisco_slap",

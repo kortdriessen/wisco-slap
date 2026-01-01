@@ -94,7 +94,7 @@ loc, acq = acq_id.split("--")
 si = wis.peri.sync.load_sync_info()
 sync_block = si[subject][exp]["acquisitions"][acq_id]["sync_block"]
 
-esum_path = wis.util.io.sub_esum_path(subject, exp, loc, acq)
+esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
 if esum_path is None:
     st.warning(f"Esum path not found: {esum_path}, choose a different Acquisition-ID")
     st.stop()
