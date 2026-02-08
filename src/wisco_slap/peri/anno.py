@@ -76,7 +76,7 @@ def load_manual_hypno(
     exp,
     sync_block,
     name="manual",
-    filter_unclear: bool = None,
+    filter_unclear: bool | None = None,
     filter_on="smooth",
     rename=True,
 ):
