@@ -1,22 +1,15 @@
 import os
 
 import matplotlib.pyplot as plt
-from matplotlib.path import Path
 import numpy as np
 import polars as pl
 import slap2_py as spy
+import tifffile as tiff
+from matplotlib.path import Path
+from PIL import Image
 
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
-import pandas as pd
-
-import wisco_slap as wis
-import slap2_py as spy
-import numpy as np
-from PIL import Image
-import os
-import matplotlib.pyplot as plt
-import tifffile as tiff
 
 annotation_root = os.path.join(DEFS.anmat_root, "annotation_materials")
 
@@ -44,7 +37,7 @@ def save_acq_mean_images(subject, exp, loc, acq, overwrite=False, vmin=5, vmax=7
     plt.style.use("dark_background")
     if wis.util.info.determine_processing_done(subject, exp, loc, acq) == "NO":
         return
-    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
     if esum_path is None:
         return
     # rois = spy.hf.load_any(esum_path, "/exptSummary/userROIs")
@@ -167,19 +160,21 @@ def save_all_subject_ref_images(overwrite=False, vmin=5, vmax=85):
     for subject in ei["subject"].unique():
         for exp in ei.filter(pl.col("subject") == subject)["experiment"].unique():
             for loc in (
-                ei.filter(pl.col("subject") == subject)
+                ei
+                .filter(pl.col("subject") == subject)
                 .filter(pl.col("experiment") == exp)["location"]
                 .unique()
             ):
                 for acq in (
-                    ei.filter(pl.col("subject") == subject)
+                    ei
+                    .filter(pl.col("subject") == subject)
                     .filter(pl.col("experiment") == exp)
                     .filter(pl.col("location") == loc)["acquisition"]
                     .unique()
                 ):
-
                     processed = (
-                        ei.filter(pl.col("subject") == subject)
+                        ei
+                        .filter(pl.col("subject") == subject)
                         .filter(pl.col("experiment") == exp)
                         .filter(pl.col("location") == loc)
                         .filter(pl.col("acquisition") == acq)["processed"]
@@ -387,13 +382,13 @@ def save_master_image_and_key(subject, exp, loc, acq, overwrite=False):
         for i in range(syns.shape[0]):
             syn = syns[i]
             syn[syn > 0] = int(i + 1)
-            syn[syn <= 0] = int(-1)
-            syn[np.isnan(syn)] = int(-1)
+            syn[syn <= 0] = -1
+            syn[np.isnan(syn)] = -1
             maps.append(syn)
         maps = np.array(maps)
         maps.shape
         synmap = np.max(maps, axis=0)
-        synmap[synmap == 0] = int(-1)
+        synmap[synmap == 0] = -1
         synmap = synmap.astype(int)
         id_list = np.array([f"{i}" for i in range(syns.shape[0])])
         id_list = np.insert(
@@ -591,12 +586,12 @@ def full_annotation_pipeline(subject, exp, loc, acq):
     create_annotation_basics(subject, exp, loc, acq)
     if not check_any_canvas_images_exist(subject, exp, loc, acq):
         if (
-            wis.util.info.determine_processing_done(subject, exp, loc, acq) == "YES"
+            wis.util.info.determine_processing_done(subject, exp, loc, acq) != "NO"
         ):  # here we save the canvas images
             save_acq_mean_images(subject, exp, loc, acq, overwrite=False)
         else:
             save_single_trial_ref_images(subject, exp, loc, acq, overwrite=False)
-    if wis.util.info.determine_processing_done(subject, exp, loc, acq) == "YES":
+    if wis.util.info.determine_processing_done(subject, exp, loc, acq) != "NO":
         save_synapse_id_plots_and_key(subject, exp, loc, acq, overwrite=False)
         save_roi_location_tiffs(subject, exp, loc, acq, overwrite=False)
     return

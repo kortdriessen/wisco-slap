@@ -29,7 +29,7 @@ loc, acq = acq_id.split("--")
 dmd = st.radio("DMD", [1, 2])
 
 
-esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
 fp = spy.hf.load_any(esum_path, f"/exptSummary/E[{dmd - 1}][0]['footprints']")
 fp = fp.swapaxes(1, 2)
 masks = fp > 0

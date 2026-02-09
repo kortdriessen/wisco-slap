@@ -1,13 +1,15 @@
 import os
+from collections.abc import Sequence
+from typing import Any
 
+import electro_py as epy
+import numpy as np
+import pandas as pd
 import polars as pl
 import slap2_py as spy
-import numpy as np
+
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
-import electro_py as epy
-import pandas as pd
-from typing import Sequence, Optional, Dict, Any
 
 
 def slap_dat_to_df(
@@ -15,7 +17,7 @@ def slap_dat_to_df(
     axis_labels: Sequence[str],
     value_axis: int,
     value_name: str,
-    new_columns: Optional[Dict[str, Any]] = None,
+    new_columns: dict[str, Any] | None = None,
 ) -> pl.DataFrame:
     df = epy.gen.df.cube_to_df(
         dat, axis_labels=axis_labels, value_axis=value_axis, value_name=value_name
@@ -45,13 +47,15 @@ def load_synid_labels(subject, exp, loc, acq):
     dia = di[subject][exp][loc][acq]
     idf = idf.with_columns(pl.lit(-1).alias("dmd-depth"))
     idf = idf.with_columns(
-        pl.when(pl.col("dmd") == 1)
+        pl
+        .when(pl.col("dmd") == 1)
         .then(pl.lit(dia["dmd-1"]["depth"]))
         .otherwise(pl.col("dmd-depth"))
         .alias("dmd-depth")
     )
     idf = idf.with_columns(
-        pl.when(pl.col("dmd") == 2)
+        pl
+        .when(pl.col("dmd") == 2)
         .then(pl.lit(dia["dmd-2"]["depth"]))
         .otherwise(pl.col("dmd-depth"))
         .alias("dmd-depth")
@@ -68,7 +72,8 @@ def load_synid_labels(subject, exp, loc, acq):
     soma_df = pl.concat(soma_dfs)
 
     idf = (
-        idf.join(soma_df, on="soma-ID", how="left", suffix="_new")
+        idf
+        .join(soma_df, on="soma-ID", how="left", suffix="_new")
         .with_columns(
             pl.coalesce([pl.col("soma-depth_new"), pl.col("soma-depth")]).alias(
                 "soma-depth"
@@ -81,7 +86,7 @@ def load_synid_labels(subject, exp, loc, acq):
 
 
 def create_full_activity_dfs(subject, exp, loc, acq):
-    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
     eset = spy.hf.io.load_full_Eset_all_dmds(esum_path, exclude_fields=["footprints"])
     fs = spy.hf.load_any(esum_path, "/exptSummary/params/analyzeHz")
     fs = float(fs[0][0])
@@ -106,9 +111,9 @@ def create_full_activity_dfs(subject, exp, loc, acq):
         tl = []
         for t in range(len(eset[dmd])):
             tl.append(eset[dmd][t]["F0"].shape[1])
-        assert (
-            len(np.unique(tl)) == 1
-        ), "trial lengths are not equal"  # TODO: there should be a better way to handle this, even if there is some heterogeneity in the trial lengths
+        assert len(np.unique(tl)) == 1, (
+            "trial lengths are not equal"
+        )  # TODO: there should be a better way to handle this, even if there is some heterogeneity in the trial lengths
         trial_length = tl[0]
         time_array_base = np.arange(0, trial_length / fs, 1 / fs)
         n_sources = eset[dmd][0]["F0"].shape[2]
@@ -376,7 +381,9 @@ def gen_and_save_activity_dfs_all_subjects(overwrite=False):
                 try:
                     print(f"Working on {subject} {exp} {acq_id}")
                     loc, acq = acq_id.split("--")
-                    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+                    esum_path = wis.util.info.get_esum_mirror_path(
+                        subject, exp, loc, acq
+                    )
                     if esum_path is None:
                         continue
                     _gen_and_save_activity_dfs(

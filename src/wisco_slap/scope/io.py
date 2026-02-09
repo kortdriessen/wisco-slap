@@ -68,7 +68,8 @@ def normalize_dend_id_column(df: pl.DataFrame) -> pl.DataFrame:
         return df
 
     return df.with_columns(
-        pl.col("dend-ID")
+        pl
+        .col("dend-ID")
         .map_elements(normalize_dend_id, return_dtype=pl.Utf8)
         .alias("dend-ID")
     )
@@ -140,7 +141,8 @@ def load_syndf(
 
     if nan_to_null:
         syndf = syndf.with_columns(
-            pl.when(pl.col("data").is_nan())
+            pl
+            .when(pl.col("data").is_nan())
             .then(pl.lit(None))
             .otherwise(pl.col("data"))
             .alias("data")
@@ -217,7 +219,8 @@ def load_lsdf(
 
     if nan_to_null:
         syndf = syndf.with_columns(
-            pl.when(pl.col("data").is_nan())
+            pl
+            .when(pl.col("data").is_nan())
             .then(pl.lit(None))
             .otherwise(pl.col("data"))
             .alias("data")
@@ -352,13 +355,15 @@ def load_synid_labels(
     dia = di[subject][exp][loc][acq]
     idf = idf.with_columns(pl.lit(-1).alias("dmd-depth"))
     idf = idf.with_columns(
-        pl.when(pl.col("dmd") == 1)
+        pl
+        .when(pl.col("dmd") == 1)
         .then(pl.lit(dia["dmd-1"]["depth"]))
         .otherwise(pl.col("dmd-depth"))
         .alias("dmd-depth")
     )
     idf = idf.with_columns(
-        pl.when(pl.col("dmd") == 2)
+        pl
+        .when(pl.col("dmd") == 2)
         .then(pl.lit(dia["dmd-2"]["depth"]))
         .otherwise(pl.col("dmd-depth"))
         .alias("dmd-depth")
@@ -375,7 +380,8 @@ def load_synid_labels(
     soma_df = pl.concat(soma_dfs)
 
     idf = (
-        idf.join(soma_df, on="soma-ID", how="left", suffix="_new")
+        idf
+        .join(soma_df, on="soma-ID", how="left", suffix="_new")
         .with_columns(
             pl.coalesce([pl.col("soma-depth_new"), pl.col("soma-depth")]).alias(
                 "soma-depth"
@@ -388,7 +394,7 @@ def load_synid_labels(
 
 
 def load_mean_ims(subject, exp, loc, acq):
-    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
     mean_ims = {}
     for dmd in [1, 2]:
         meanim = spy.hf.load_any(esum_path, f"/exptSummary/meanIM[{dmd - 1}][0]")
@@ -399,7 +405,7 @@ def load_mean_ims(subject, exp, loc, acq):
 
 def load_fprts(subject, exp, loc, acq):
     fps = {}
-    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
     for dmd in [1, 2]:
         fp = spy.hf.load_any(esum_path, f"/exptSummary/E[{dmd - 1}][0]['footprints']")
         fp = fp.swapaxes(1, 2)

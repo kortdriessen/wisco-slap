@@ -4,7 +4,6 @@ import numpy as np
 import polars as pl
 import slap2_py as spy
 import streamlit as st
-from PIL import Image
 from webagg_selector import start_selector_process, stop_selector_process
 
 import wisco_slap as wis
@@ -80,7 +79,8 @@ subjects = sorted(exp_info["subject"].unique().to_list())
 subject = st.selectbox("Subject", subjects, key="subject")
 
 subject_exps = sorted(
-    exp_info.filter(pl.col("subject") == st.session_state.subject)["experiment"]
+    exp_info
+    .filter(pl.col("subject") == st.session_state.subject)["experiment"]
     .unique()
     .to_list()
 )
@@ -94,7 +94,7 @@ loc, acq = acq_id.split("--")
 si = wis.peri.sync.load_sync_info()
 sync_block = si[subject][exp]["acquisitions"][acq_id]["sync_block"]
 
-esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
 if esum_path is None:
     st.warning(f"Esum path not found: {esum_path}, choose a different Acquisition-ID")
     st.stop()

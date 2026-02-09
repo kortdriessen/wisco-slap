@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import os
+
 # -------- Defaults (edit these) --------
-data_root: str = "/Volumes/slap_mi/slap_mi/data"
-anmat_root: str = "/Volumes/slap_mi/slap_mi/analysis_materials"
-plots_root: str = "/Volumes/slap_mi/slap_mi/analysis_materials/plots"
+# raw data root, on the NAS
+data_root: str = (
+    "/run/user/1329238735/gvfs/smb-share:server=tononi-nas,share=slap_mi/slap_mi/data"
+)
+# root of the analysis directory, local
+anmat_root: str = "/data/slap_analysis/analysis_materials"
+# -------------------------------------------------------------
+
+exsum_mirror_root = os.path.join(anmat_root, "ExSum_mirrors")
+plots_root = os.path.join(anmat_root, "plots")
+
 
 dlc_root: str = "/Volumes/npx_nfs/slap/slap_mi_in_the_pupil"
 dlc_proj_root: str = f"{dlc_root}/dlc_slap_pupil-KD-2025-09-23"

@@ -4,11 +4,11 @@ import os
 import h5py
 import numpy as np
 import polars as pl
+import yaml
 
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
 from wisco_slap.util.info import load_exp_info_spreadsheet
-import yaml
 
 
 def estimate_start_time(subject, exp, loc, acq):
@@ -87,7 +87,7 @@ def get_exsum_date(subject, exp, loc, acq):
 
 
 def get_refstack_used(subject, exp, loc, acq):
-    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
     if esum_path is None:
         return None
     with h5py.File(esum_path, "r") as f:
@@ -98,7 +98,7 @@ def get_refstack_used(subject, exp, loc, acq):
 
 
 def get_analyze_hz(subject, exp, loc, acq):
-    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
     if esum_path is None:
         return None
     with h5py.File(esum_path, "r") as f:
@@ -107,7 +107,7 @@ def get_analyze_hz(subject, exp, loc, acq):
 
 
 def get_draw_user_rois(subject, exp, loc, acq):
-    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
     if esum_path is None:
         return None
     with h5py.File(esum_path, "r") as f:
@@ -117,7 +117,8 @@ def get_draw_user_rois(subject, exp, loc, acq):
 
 def update_estimated_start_time(ei, subject, exp, loc, acq):
     ei = ei.with_columns(
-        pl.when(
+        pl
+        .when(
             (pl.col("subject") == subject)
             & (pl.col("experiment") == exp)
             & (pl.col("location") == loc)
@@ -133,7 +134,8 @@ def update_estimated_start_time(ei, subject, exp, loc, acq):
 def update_estimated_duration(ei, subject, exp, loc, acq):
     """Update the estimated duration for a given acquisition."""
     ei = ei.with_columns(
-        pl.when(
+        pl
+        .when(
             (pl.col("subject") == subject)
             & (pl.col("experiment") == exp)
             & (pl.col("location") == loc)
@@ -149,7 +151,8 @@ def update_estimated_duration(ei, subject, exp, loc, acq):
 def update_processing_done(ei, subject, exp, loc, acq):
     pdone = wis.util.info.determine_processing_done(subject, exp, loc, acq)
     ei = ei.with_columns(
-        pl.when(
+        pl
+        .when(
             (pl.col("subject") == subject)
             & (pl.col("experiment") == exp)
             & (pl.col("location") == loc)
@@ -165,7 +168,8 @@ def update_processing_done(ei, subject, exp, loc, acq):
 def update_exsum_date(ei, subject, exp, loc, acq):
     exsum_date = get_exsum_date(subject, exp, loc, acq)
     ei = ei.with_columns(
-        pl.when(
+        pl
+        .when(
             (pl.col("subject") == subject)
             & (pl.col("experiment") == exp)
             & (pl.col("location") == loc)
@@ -181,7 +185,8 @@ def update_exsum_date(ei, subject, exp, loc, acq):
 def update_refstack_used(ei, subject, exp, loc, acq):
     refstack_used = get_refstack_used(subject, exp, loc, acq)
     ei = ei.with_columns(
-        pl.when(
+        pl
+        .when(
             (pl.col("subject") == subject)
             & (pl.col("experiment") == exp)
             & (pl.col("location") == loc)
@@ -197,7 +202,8 @@ def update_refstack_used(ei, subject, exp, loc, acq):
 def update_analyze_hz(ei, subject, exp, loc, acq):
     analyze_hz = get_analyze_hz(subject, exp, loc, acq)
     ei = ei.with_columns(
-        pl.when(
+        pl
+        .when(
             (pl.col("subject") == subject)
             & (pl.col("experiment") == exp)
             & (pl.col("location") == loc)
@@ -213,7 +219,8 @@ def update_analyze_hz(ei, subject, exp, loc, acq):
 def update_draw_user_rois(ei, subject, exp, loc, acq):
     draw_user_rois = get_draw_user_rois(subject, exp, loc, acq)
     ei = ei.with_columns(
-        pl.when(
+        pl
+        .when(
             (pl.col("subject") == subject)
             & (pl.col("experiment") == exp)
             & (pl.col("location") == loc)
@@ -232,12 +239,14 @@ def update_exp_info_spreadsheet():
     for subject in ei["subject"].unique():
         for exp in ei.filter(pl.col("subject") == subject)["experiment"].unique():
             for loc in (
-                ei.filter(pl.col("subject") == subject)
+                ei
+                .filter(pl.col("subject") == subject)
                 .filter(pl.col("experiment") == exp)["location"]
                 .unique()
             ):
                 for acq in (
-                    ei.filter(pl.col("subject") == subject)
+                    ei
+                    .filter(pl.col("subject") == subject)
                     .filter(pl.col("experiment") == exp)
                     .filter(pl.col("location") == loc)["acquisition"]
                     .unique()
@@ -266,11 +275,11 @@ def update_all_subject_sync_info(redo=False):
 
 def _update_dmd_info(subject, exp, loc, acq):
     dmd_info_path = f"{DEFS.anmat_root}/dmd_info.yaml"
-    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
     if esum_path is None:
         print(f"{subject} {exp} {loc} {acq} has no esum path")
         return None
-    with open(dmd_info_path, "r") as f:
+    with open(dmd_info_path) as f:
         dmd_info = yaml.safe_load(f)
     if subject not in dmd_info:
         dmd_info[subject] = {}
@@ -289,12 +298,12 @@ def _update_dmd_info(subject, exp, loc, acq):
     for dmd in [1, 2]:
         roi = wis.pipes.annotation_materials._get_roi_container(esum_path, dmd)
         if roi[0] == 0:
-            dmd_info[subject][exp][loc][acq]["dmd-{}".format(dmd)]["somas"] = []
+            dmd_info[subject][exp][loc][acq][f"dmd-{dmd}"]["somas"] = []
         else:
             roi_names = []
             for r in roi:
                 roi_names.append(r["Label"])
-            dmd_info[subject][exp][loc][acq]["dmd-{}".format(dmd)]["somas"] = roi_names
+            dmd_info[subject][exp][loc][acq][f"dmd-{dmd}"]["somas"] = roi_names
     with open(dmd_info_path, "w") as f:
         yaml.dump(dmd_info, f)
 

@@ -2,13 +2,9 @@ import os
 
 import polars as pl
 import slap2_py as spy
-import numpy as np
+
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
-import electro_py as epy
-import pandas as pd
-from typing import Sequence, Optional, Dict, Any
-import tifffile as tiff
 
 
 def check_all_activity_dfs_exist(
@@ -67,7 +63,7 @@ def gen_and_save_all_activity_dfs(
     f0df_path = all_paths[4]
 
     wis.util.gen.check_dir(os.path.dirname(df_path))
-    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+    esum_path = wis.util.info.get_esum_mirror_path(subject, exp, loc, acq)
     eset = spy.ExSum.from_mat73(esum_path)
 
     if os.path.exists(df_path):
@@ -145,7 +141,9 @@ def gen_and_save_activity_dfs_all_subjects(overwrite=False):
                 try:
                     print(f"Working on {subject} {exp} {acq_id}")
                     loc, acq = acq_id.split("--")
-                    esum_path = wis.util.info.sub_esum_path(subject, exp, loc, acq)
+                    esum_path = wis.util.info.get_esum_mirror_path(
+                        subject, exp, loc, acq
+                    )
                     if esum_path is None:
                         continue
                     gen_and_save_all_activity_dfs(
