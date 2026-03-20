@@ -3,17 +3,13 @@ subpackage for dealing with peripherals (ephys, video, syncrhonization, etc.)
 """
 
 from . import (
-    ephys as ephys,
+    anno as anno,
 )
 from . import (
-    sync as sync,
+    ephys as ephys,
 )
 from . import (
     vid as vid,
 )
 
-from . import (
-    anno as anno,
-)
-
-__all__ = ["ephys", "sync", "vid", "anno"]
+__all__ = ["ephys", "vid", "anno"]

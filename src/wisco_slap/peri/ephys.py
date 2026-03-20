@@ -12,7 +12,7 @@ def get_ephys_sync_block_path(subject, exp, sync_block):
 
 
 def get_block_paths(subject, exp):
-    sb, sp = wis.peri.sync.get_all_sync_paths(subject, exp)
+    sb, sp = wis.meta.sync.get_all_sync_paths(subject, exp)
     ephys_dir = f"{DEFS.data_root}/{subject}/{exp}/ephys"
     bp = []
     for block in sb:
@@ -22,7 +22,11 @@ def get_block_paths(subject, exp):
 
 
 def load_single_ephys_block(
-    subject: str, exp: str, stores: list[str] = None, sync_block: int = 1, store_chans: dict = DEFS.store_chans
+    subject: str,
+    exp: str,
+    stores: list[str] = None,
+    sync_block: int = 1,
+    store_chans: dict = DEFS.store_chans,
 ):
     """Load ephys data for a given experiment.
 

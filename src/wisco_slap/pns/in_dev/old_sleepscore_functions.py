@@ -1,0 +1,360 @@
+def _save_eye_traces_for_scoring(
+    subject, exp, sb, overwrite=False, likelihood_threshold=0.2
+):
+    eyedir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/eye"
+    wis.util.check_dir(eyedir)
+    eye_mets = ["dia", "motion", "lid"]
+    met_paths = [
+        Path(
+            f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/eye/{met}_y.npy"
+        )
+        for met in eye_mets
+    ]
+
+    if all(path.exists() for path in met_paths) and not overwrite:
+        print(f"Eye traces for {subject} {exp} sync block-{sb} already exist")
+        return
+    elif all(path.exists() for path in met_paths) and overwrite:
+        # delete everything in the directory
+        for f in os.listdir(
+            f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/eye"
+        ):
+            os.remove(
+                f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/eye/{f}"
+            )
+
+    # load the eye metric df and filter out low likelihood data
+    try:
+        edf = wis.peri.vid.load_eye_metric_df(subject, exp, sb)
+    except FileNotFoundError:
+        print(
+            f"Eye metric df for {subject} {exp} sync block-{sb} do not exist, save it before saving scoring data!"
+        )
+        return
+
+    pup = edf["frame", "diameter", "motion", "pup_likelihood"]
+    lid = edf["frame", "lid", "lid_norm", "lid_likelihood"]
+    for col in ["diameter", "motion"]:
+        pup = pup.with_columns(
+            pl
+            .when(pl.col("pup_likelihood") < likelihood_threshold)
+            .then(pl.lit(np.nan))
+            .otherwise(pl.col(col))
+            .alias(col)
+        )
+    for col in ["lid", "lid_norm"]:
+        lid = lid.with_columns(
+            pl
+            .when(pl.col("lid_likelihood") < likelihood_threshold)
+            .then(pl.lit(np.nan))
+            .otherwise(pl.col(col))
+            .alias(col)
+        )
+
+    # save the filtered data and frame time copies
+    dia = pup["diameter"].to_numpy()
+    motion = pup["motion"].to_numpy()
+    lid = lid["lid"].to_numpy()
+    time = edf["time"].to_numpy()
+    np.save(f"{eyedir}/dia_y.npy", dia)
+    np.save(f"{eyedir}/motion_y.npy", motion)
+    np.save(f"{eyedir}/lid_y.npy", lid)
+    np.save(f"{eyedir}/dia_t.npy", time)
+    np.save(f"{eyedir}/motion_t.npy", time)
+    np.save(f"{eyedir}/lid_t.npy", time)
+    return
+
+
+def save_eye_traces_for_scoring_all_subjects(overwrite=False):
+    si = wis.meta.get.sync_info()
+    for subject in si.keys():
+        for exp in si[subject].keys():
+            for sb in si[subject][exp]["sync_blocks"].keys():
+                try:
+                    _save_eye_traces_for_scoring(subject, exp, sb, overwrite=overwrite)
+                except Exception as e:
+                    print(
+                        f"Error saving eye traces for {subject} {exp} sync block-{sb}: {e}"
+                    )
+                    continue
+    return
+
+
+def _save_whisking_traces_for_scoring(subject, exp, sync_block, overwrite=False):
+    save_dir = os.path.join(
+        DEFS.anmat_root, subject, exp,
+        "scoring_data", f"sync_block-{sync_block}", "whisking",
+    )
+    wis.util.check_dir(save_dir)
+
+    whis_path = os.path.join(save_dir, "whis_y.npy")
+    time_path = os.path.join(save_dir, "whis_t.npy")
+    if os.path.exists(whis_path) and os.path.exists(time_path) and not overwrite:
+        print(
+            f"Whisking traces for {subject} {exp} sync block-{sync_block} already exist"
+        )
+        return
+    elif os.path.exists(whis_path) and os.path.exists(time_path) and overwrite:
+        os.remove(whis_path)
+        os.remove(time_path)
+    try:
+        whisk_df = wis.peri.vid.load_whisking_df(subject, exp, sync_block)
+    except FileNotFoundError:
+        print(
+            f"Whisking df for {subject} {exp} sync block-{sync_block} does not exist, save it before saving scoring data!"
+        )
+        return
+    whisk = whisk_df["whis"].to_numpy()
+    time = whisk_df["time"].to_numpy()
+    np.save(whis_path, whisk)
+    np.save(time_path, time)
+    return
+
+
+def save_whisking_traces_for_scoring_all_subjects(overwrite=False):
+    si = wis.meta.get.sync_info()
+    for subject in si.keys():
+        for exp in si[subject].keys():
+            for sb in si[subject][exp]["sync_blocks"].keys():
+                try:
+                    _save_whisking_traces_for_scoring(
+                        subject, exp, sb, overwrite=overwrite
+                    )
+                except Exception as e:
+                    print(
+                        f"Error saving whisking traces for {subject} {exp} sync block-{sb}: {e}"
+                    )
+                    continue
+    return
+
+
+def write_roi_traces_for_scoring(
+    subject, exp, loc, acq, roi_version="Fsvd", roi_channel=1, overwrite=False
+):
+    # raise an error that this function is deprecated and use write_roi_dff_traces_for_scoring instead
+    raise ValueError(
+        "This function is deprecated and use write_roi_dff_traces_for_scoring instead"
+    )
+    roidf = wis.scope.io.load_roidf(
+        subject, exp, loc, acq, roi_version=roi_version, channel=roi_channel
+    )
+    act_key = "data"
+    acq_id = f"{loc}--{acq}"
+    si = wis.meta.get.sync_info()
+    ephys_offset = si[subject][exp]["acquisitions"][acq_id]["ephys_offset"]
+    sync_block = si[subject][exp]["acquisitions"][acq_id]["sync_block"]
+    save_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sync_block}/scope_traces/soma_rois/{acq_id}"
+    wis.util.check_dir(save_dir)
+    locletter = loc.split("_")[1]
+    acqnumber = acq.split("_")[1]
+    for dmd in [1, 2]:
+        dmd_df = roidf.filter(pl.col("dmd") == dmd)
+        if len(dmd_df) == 0:
+            continue
+        for roi in dmd_df["soma-ID"].unique():
+            data_path = f"{save_dir}/{locletter}{acqnumber}{roi}-dmd{dmd}_y.npy"
+            t_path = f"{save_dir}/{locletter}{acqnumber}{roi}-dmd{dmd}_t.npy"
+            if os.path.exists(data_path) and os.path.exists(t_path) and not overwrite:
+                continue
+            elif os.path.exists(data_path) and os.path.exists(t_path) and overwrite:
+                os.system(f"rm -rf {data_path}")
+                os.system(f"rm -rf {t_path}")
+            roi_df = dmd_df.filter(pl.col("soma-ID") == roi)
+            roi_data = roi_df[act_key].to_numpy()
+            roi_times = roi_df["time"].to_numpy() + ephys_offset
+            np.save(data_path, roi_data)
+            np.save(t_path, roi_times)
+    return
+
+
+def write_roi_dff_traces_for_scoring(
+    subject, exp, loc, acq, roi_version="Fsvd", roi_channel=1, overwrite=False
+):
+    roidf = wis.scope.io.load_roidf(
+        subject, exp, loc, acq, roi_version=roi_version, channel=roi_channel
+    )
+    dff, evdf = wis.scope.somas.detect_CaEvents(roidf)
+    act_key = "dff"
+    acq_id = f"{loc}--{acq}"
+    si = wis.meta.get.sync_info()
+    ephys_offset = si[subject][exp]["acquisitions"][acq_id]["ephys_offset"]
+    sync_block = si[subject][exp]["acquisitions"][acq_id]["sync_block"]
+    save_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sync_block}/scope_traces/soma_rois/{acq_id}/dff"
+    wis.util.check_dir(save_dir)
+    locletter = loc.split("_")[1]
+    acqnumber = acq.split("_")[1]
+    for roi in dff["soma-ID"].unique():
+        data_path = f"{save_dir}/{locletter}{acqnumber}{roi}_y.npy"
+        t_path = f"{save_dir}/{locletter}{acqnumber}{roi}_t.npy"
+        if os.path.exists(data_path) and os.path.exists(t_path) and not overwrite:
+            continue
+        elif os.path.exists(data_path) and os.path.exists(t_path) and overwrite:
+            os.system(f"rm -rf {data_path}")
+            os.system(f"rm -rf {t_path}")
+        roi_df = dff.filter(pl.col("soma-ID") == roi)
+        roi_data = roi_df[act_key].to_numpy()
+        roi_times = roi_df["time"].to_numpy() + ephys_offset
+        np.save(data_path, roi_data)
+        np.save(t_path, roi_times)
+    return
+
+
+def write_roi_traces_for_scoring_all_subjects(overwrite=False):
+    si = wis.meta.get.sync_info()
+    for subject in si.keys():
+        for exp in si[subject].keys():
+            acq_ids = wis.meta.get.unique_acquisitions_per_experiment(subject, exp)
+            for acq_id in acq_ids:
+                loc, acq = acq_id.split("--")
+                try:
+                    write_roi_traces_for_scoring(
+                        subject, exp, loc, acq, overwrite=overwrite
+                    )
+                except Exception as e:
+                    print(
+                        f"Error writing ROI traces for {subject} {exp} {loc} {acq}: {e}"
+                    )
+                    continue
+    return
+
+
+def save_glutamate_sums_for_scoring(
+    subject, exp, loc, acq, min_sources=10, overwrite=False
+):
+    sb = wis.meta.sync.get_acq_sync_block(subject, exp, loc, acq)
+    sum_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/scope_traces/synapses/{loc}--{acq}/glutamate_sums"
+    if os.path.exists(sum_dir) and not overwrite:
+        # make sure the dir is not empty
+        if len(os.listdir(sum_dir)) > 0:
+            print(
+                f"Glutamate sums already exist: {sum_dir}, use overwrite=True to overwrite"
+            )
+            return
+    else:
+        os.system(f"rm -rf {sum_dir}")
+        wis.util.check_dir(sum_dir)
+
+    df = wis.scope.io.load_syndf(subject, exp, loc, acq, apply_ephys_offset=True)
+    df = df.with_columns((pl.col("noise") * 5).alias("sd5"))
+    df = df.with_columns(
+        pl
+        .when(pl.col("data") > pl.col("sd5"))
+        .then(pl.lit(True))
+        .otherwise(pl.lit(False))
+        .alias("active")
+    )
+    wis.util.check_dir(sum_dir)
+    min_sources = 10
+    if "soma-ID" not in df.columns:
+        raise ValueError(
+            f"soma-ID column not found in df for {subject} {exp} {loc} {acq}"
+        )
+    for sid in df["soma-ID"].unique():
+        if "unidentifiable" in sid:
+            continue
+        d = df.filter(pl.col("soma-ID") == sid)
+        n_unique_combinations = d.select(["dmd", "source-ID"]).n_unique()
+        if n_unique_combinations < min_sources:
+            continue
+        glut_sums = d.group_by("time").agg(pl.sum("data"))
+        glut_sums = glut_sums.sort("time")
+        data = glut_sums["data"].to_numpy()
+        time = glut_sums["time"].to_numpy()
+        name = f"{sid}-{n_unique_combinations}"
+        np.save(f"{sum_dir}/{name}_y.npy", data)
+        np.save(f"{sum_dir}/{name}_t.npy", time)
+
+    sum_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/scope_traces/synapses/{loc}--{acq}/glutamate_sums/fracactive"
+    wis.util.check_dir(sum_dir)
+
+    for sid in df["soma-ID"].unique():
+        if "unidentifiable" in sid:
+            continue
+        d = df.filter(pl.col("soma-ID") == sid)
+        n_unique_combinations = d.select(["dmd", "source-ID"]).n_unique()
+        if n_unique_combinations < min_sources:
+            continue
+        glut_sums = d.group_by("time").agg(pl.sum("active"))
+        glut_sums = glut_sums.sort("time")
+        data = glut_sums["active"].to_numpy()
+        data = (data / n_unique_combinations) * 100
+        time = glut_sums["time"].to_numpy()
+        name = f"{sid}-{n_unique_combinations}"
+        np.save(f"{sum_dir}/{name}_y.npy", data)
+        np.save(f"{sum_dir}/{name}_t.npy", time)
+
+
+def save_glutamate_sums_all_subjects(overwrite=False):
+    si = wis.meta.get.sync_info()
+    for subject in si.keys():
+        for exp in si[subject].keys():
+            acq_ids = wis.meta.get.unique_acquisitions_per_experiment(subject, exp)
+            for acq_id in acq_ids:
+                try:
+                    print(f"Working on {subject} {exp} {acq_id}")
+                    loc, acq = acq_id.split("--")
+                    save_glutamate_sums_for_scoring(
+                        subject, exp, loc, acq, overwrite=overwrite
+                    )
+                except Exception as e:
+                    print(
+                        f"Error saving glutamate sums for {subject} {exp} {loc} {acq}: {e}"
+                    )
+                    continue
+
+
+def full_scoring_data_pipeline(subject, exp, loc, acq, overwrite=False):
+    save_peripheral_scoring_data(subject, exp, overwrite=overwrite)
+    write_roi_dff_traces_for_scoring(subject, exp, loc, acq, overwrite=overwrite)
+    save_glutamate_sums_for_scoring(subject, exp, loc, acq, overwrite=overwrite)
+    return
+
+
+def save_matrix_arrays_for_viewer(subject, exp, loc, acq, soma_id, snr_thresh=5):
+    """
+    Save matrix arrays for a given subject, experiment, location, and acquisition.
+    """
+    idf = wis.get.synid_labels(subject, exp, loc, acq)
+    dend_ids = idf.filter(pl.col("soma-ID") == soma_id)["dend-ID"].unique().to_numpy()
+    dend_ids = dend_ids[dend_ids != None]
+    dend_ids = np.sort(dend_ids)
+    syn_orders = wis.scope.syn_topo.load_syn_orders(subject, exp, loc, acq)
+    bdf = wis.scope.io.load_bayes_ev_df(subject, exp, loc, acq)
+    idf_d = idf.select(["dend-ID", "source-ID", "dmd"])
+    bdf = bdf.join(idf_d, on=["dmd", "source-ID"], how="left")
+    bdf = bdf.sort("time")
+    bdf = bdf.filter(pl.col("mfsnr") > snr_thresh)
+    dmd_colors = []
+    si = wis.meta.get.sync_info()
+    for dend in dend_ids:
+        dend_dmd = idf.filter(pl.col("dend-ID") == dend)["dmd"].unique().to_numpy()
+        bdf_dend = bdf.filter(pl.col("dend-ID") == dend)
+        dend_order = syn_orders[dend]
+        syn_vals_raw = bdf_dend["source-ID"].to_numpy()
+        sb = si[subject][exp]["acquisitions"][f"{loc}--{acq}"]["sync_block"]
+        root = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sb}/glut_events/{loc}--{acq}"
+        wis.util.check_dir(root)
+
+        # Map each value in syn_vals_raw to its index position in dend_order
+        order_map = {source_id: idx for idx, source_id in enumerate(dend_order)}
+        syn_vals = np.array([order_map[s] for s in syn_vals_raw])
+        t_vals = bdf_dend["time"].to_numpy()
+        snr_vals = bdf_dend["mfsnr"].to_numpy()
+        # normalize snr_vals so that all values are between 0.3 and 1
+        snr_vals = (snr_vals - snr_vals.min()) / (snr_vals.max() - snr_vals.min())
+        snr_vals = snr_vals * 0.7 + 0.3
+
+        ephys_offset = si[subject][exp]["acquisitions"][f"{loc}--{acq}"]["ephys_offset"]
+        t_vals = t_vals + ephys_offset
+
+        # save the 3 major arrays
+        np.save(f"{root}/{dend}_y.npy", syn_vals)
+        np.save(f"{root}/{dend}_t.npy", t_vals)
+        np.save(f"{root}/{dend}_snr.npy", snr_vals)
+        if dend_dmd == 1:
+            dmd_color = "#ff0dd7"
+        else:
+            dmd_color = "#42f551"
+        dmd_colors.append(dmd_color)
+    dmd_colors = np.array(dmd_colors)
+    np.save(f"{root}/dmd_colors.npy", dmd_colors)

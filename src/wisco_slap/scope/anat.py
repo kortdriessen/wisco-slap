@@ -1,13 +1,11 @@
 from pathlib import Path
 
-from matplotlib.patches import Circle
 import matplotlib.pyplot as plt
 import yaml
-from matplotlib.patches import Rectangle
-import numpy as np
-import wisco_slap.defs as DEFS
+from matplotlib.patches import Circle, Rectangle
+
 import wisco_slap as wis
-import polars as pl
+import wisco_slap.defs as DEFS
 
 
 def anat_path(subject):
@@ -115,7 +113,7 @@ def plot_3mm_window(subject, f, ax, diameter=3):
 
 
 def get_somas_by_dmd(subject, exp, loc, acq):
-    di = wis.util.info.load_dmd_info()
+    di = wis.meta.get.dmd_info()
     dia = di[subject][exp][loc][acq]
     somas_by_dmd = {}
     for dmd in dia.keys():

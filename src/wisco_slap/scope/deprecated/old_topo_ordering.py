@@ -1,13 +1,7 @@
-from pathlib import Path
-
-from matplotlib.patches import Circle
-import matplotlib.pyplot as plt
-import yaml
-from matplotlib.patches import Rectangle
 import numpy as np
-import wisco_slap.defs as DEFS
-import wisco_slap as wis
 import polars as pl
+
+import wisco_slap as wis
 
 
 def _find_cell_center_pixels(roi_map: np.ndarray):
@@ -85,7 +79,7 @@ def find_synapse_pixels(footprints: dict[int, np.ndarray]):
 
 
 def get_all_coords(subject, exp, loc, acq):
-    di = wis.util.info.load_dmd_info()
+    di = wis.meta.get.dmd_info()
     dia = di[subject][exp][loc][acq]
     fp = wis.scope.io.load_fprts(subject, exp, loc, acq)
     fullrm = wis.scope.io.load_dual_roi_map(subject, exp, loc, acq)
@@ -207,7 +201,7 @@ def synapse_vectors(
 
 def get_real_somas(subject, exp, loc, acq):
 
-    di = wis.util.info.load_dmd_info()
+    di = wis.meta.get.dmd_info()
     dia = di[subject][exp][loc][acq]
     real_somas = {}
     for dmd in dia.keys():
@@ -228,7 +222,8 @@ def _map_vectors_to_synid_labels(real_somas, roi_coords, fp_coords, idf):
         soma_coords = roi_coords[dmd_num][soma]
         for dmd in [1, 2]:
             sdis = (
-                idf.filter(pl.col("soma-ID") == soma)
+                idf
+                .filter(pl.col("soma-ID") == soma)
                 .filter(pl.col("dmd") == dmd)["source"]
                 .to_list()
             )

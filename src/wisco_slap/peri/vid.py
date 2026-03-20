@@ -1,6 +1,5 @@
 import math
 import os
-from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -89,12 +88,15 @@ def clean_raw_pupil_df(df):
 
 
 def load_cleaned_dlc_pupil_df(subject, exp, sb):
-    pupil_dir = f"{DEFS.anmat_root}/{subject}/{exp}/pupil_inference"
+    pupil_dir = os.path.join(
+        DEFS.anmat_root, subject, exp,
+        "sync_block_data", f"sync_block-{sb}", "pupil",
+    )
     dlc_tag = "DLC_Resnet50_dlc_slap_pupilSep23shuffle0_snapshot_best-60"
     pupil_name = f"pupil-{sb}"
     csv_name = f"{pupil_name}{dlc_tag}.csv"
-    csv_path = Path(f"{pupil_dir}/{csv_name}")
-    if csv_path.exists():
+    csv_path = os.path.join(pupil_dir, csv_name)
+    if os.path.exists(csv_path):
         df_raw = pl.read_csv(csv_path)
         df_clean = clean_raw_pupil_df(df_raw)
         return df_clean
@@ -427,11 +429,17 @@ def compute_eye_metric_df(subject, exp, sb):
 
 
 def load_eye_metric_df(subject, exp, sb):
-    eyedir = f"{DEFS.anmat_root}/{subject}/{exp}/pupil_inference/eye_metrics"
-    edf_path = f"{eyedir}/eye_metrics-{sb}.parquet"
+    eyedir = os.path.join(
+        DEFS.anmat_root, subject, exp,
+        "sync_block_data", f"sync_block-{sb}", "pupil", "eye_metrics",
+    )
+    edf_path = os.path.join(eyedir, "eye_metrics.parquet")
     return pl.read_parquet(edf_path)
 
 
 def load_whisking_df(subject, exp, sb):
-    path = f"{DEFS.anmat_root}/{subject}/{exp}/whisking/whisk_df-{sb}.parquet"
+    path = os.path.join(
+        DEFS.anmat_root, subject, exp,
+        "sync_block_data", f"sync_block-{sb}", "whisking", "whisk_df.parquet",
+    )
     return pl.read_parquet(path)

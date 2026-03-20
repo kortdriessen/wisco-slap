@@ -3,10 +3,10 @@ Utilities for working with SLAP2 data
 """
 
 from . import (
-    gen as gen,
+    checks as checks,
 )
-from . import (
-    info as info,
-)
+from .core import *
 
-__all__ = ["gen", "info"]
+__all__ = [
+    "checks",
+]

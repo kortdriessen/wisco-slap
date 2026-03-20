@@ -11,18 +11,19 @@ data_root: str = (
 anmat_root: str = "/data/slap_analysis/analysis_materials"
 # -------------------------------------------------------------
 
+annotation_root = os.path.join(anmat_root, "annotation_materials")
+
 exsum_mirror_root = os.path.join(anmat_root, "ExSum_mirrors")
 plots_root = os.path.join(anmat_root, "plots")
 
 
-dlc_root: str = "/Volumes/npx_nfs/slap/slap_mi_in_the_pupil"
-dlc_proj_root: str = f"{dlc_root}/dlc_slap_pupil-KD-2025-09-23"
-dlc_env_py: str = f"{dlc_root}/.venv/bin/python"
-dlc_env_py: str = f"{dlc_root}/.venv/bin/python"
-dlc_config_path: str = f"{dlc_proj_root}/config.yaml"
+dlc_root: str = "/data/slap_analysis/slap_mi_in_the_pupil"
+dlc_proj_root: str = os.path.join(dlc_root, "dlc_slap_pupil-KD-2025-09-23")
+dlc_env_py: str = os.path.join(dlc_root, ".venv", "bin", "python")
+dlc_config_path: str = os.path.join(dlc_proj_root, "config.yaml")
 
 store_chans = {}
-store_chans["EEGr"] = [1, 2]
+store_chans["EEGr"] = [1]
 store_chans["EEG_"] = [1]
 store_chans["loal"] = [1]
 store_chans["Wav1"] = [1]
