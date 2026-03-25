@@ -46,3 +46,13 @@ state_colors = {
     "Sort-Exclude": "#FF7F50",
     "unclear": "#FFFF00",
 }
+
+color_defs = {
+    "whisk": "#0504aa",  # xkcd: royal blue
+    "pupil": "#36013f",  # xkcd: deep purple
+    "loal": "#411900",
+    "glugreen_light": "#0cf000",
+    "glugreen": "#2ec700",
+    "jred": "#d60b1f",
+    "deepgray": "#212121",
+}

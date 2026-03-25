@@ -90,40 +90,6 @@ def glu_events_basic(
     return df
 
 
-def event_det_filtered(
-    subject: str,
-    exp: str,
-    loc: str,
-    acq: str,
-    dmd: int | None = None,
-    syn_ids: Sequence[int] | None = None,
-    channels: Sequence[int] | int | None = None,
-) -> dict[str, xr.DataArray]:
-    """Load matched-filter output from event detection.
-
-    Parameters
-    ----------
-    subject, exp, loc, acq : str
-        Acquisition identifiers.
-    dmd : int or None
-        DMD number (1 or 2). None loads both.
-    syn_ids : sequence of int or None
-        Subset of synapse IDs to load. None loads all.
-    channels : sequence of int, int, or None
-        Subset of channels to load. None loads all.
-
-    Returns
-    -------
-    dict[str, xr.DataArray]
-        Mapping from ``"dmd_1"`` / ``"dmd_2"`` to DataArray with dims
-        ``(channel, syn_id, time)``.
-    """
-    path = os.path.join(_ev_dir(subject, exp, loc, acq), "filtered.zarr")
-    return load_xr_from_zarr(
-        path, dmd=_resolve_dmd(dmd), sel=_build_sel(syn_ids, channels)
-    )
-
-
 def matchFilt_traces(
     subject: str,
     exp: str,
@@ -244,35 +210,3 @@ def matchFilt_noise_std(
     return result
 
 
-def event_det_noise_std(
-    subject: str,
-    exp: str,
-    loc: str,
-    acq: str,
-    dmd: int | None = None,
-    syn_ids: Sequence[int] | None = None,
-    channels: Sequence[int] | int | None = None,
-) -> dict[str, xr.DataArray]:
-    """Load rolling MAD noise estimate from event detection.
-
-    Parameters
-    ----------
-    subject, exp, loc, acq : str
-        Acquisition identifiers.
-    dmd : int or None
-        DMD number (1 or 2). None loads both.
-    syn_ids : sequence of int or None
-        Subset of synapse IDs to load. None loads all.
-    channels : sequence of int, int, or None
-        Subset of channels to load. None loads all.
-
-    Returns
-    -------
-    dict[str, xr.DataArray]
-        Mapping from ``"dmd_1"`` / ``"dmd_2"`` to DataArray with dims
-        ``(channel, syn_id, time)``.
-    """
-    path = os.path.join(_ev_dir(subject, exp, loc, acq), "noise_std.zarr")
-    return load_xr_from_zarr(
-        path, dmd=_resolve_dmd(dmd), sel=_build_sel(syn_ids, channels)
-    )

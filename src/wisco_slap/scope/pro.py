@@ -2,14 +2,24 @@
 Trace post-processing: recreate NoLoCo-era trace variants from the LoCo LS trace.
 
 Functions here apply temporal filters / deconvolutions to scopex xarray
-DataArrays (typically dims ``["channel", "syn_id", "time"]``).
+DataArrays (typically dims ``["channel", "syn_id", "time"]``). This module
+also includes ROI dF/F helpers for ScopeX user-defined ROIs.
 """
+
+import warnings
 
 import numpy as np
 import xarray as xr
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy.interpolate import PchipInterpolator
 from scipy.signal import fftconvolve, lfilter
 
 IGLUSNFR_TAU_S: float = 0.026  # 26 ms decay constant (from iGluSnFR4f paper)
+ROI_DFF_DENOISE_WINDOW_S: float = 0.2
+ROI_DFF_BASELINE_WINDOW_GLU_S: float = 4.0
+ROI_DFF_BASELINE_WINDOW_CA_S: float = 4.0
+_ROI_DFF_DIV_ABS_EPS: float = 1e-12
+_ROI_DFF_DIV_REL_EPS: float = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +159,173 @@ def _richardson_lucy(
     return estimate
 
 
+def _window_to_samples(window_s: float, fs: float) -> int:
+    """Convert a window in seconds to a centered moving-window sample count."""
+    return max(1, int(round(window_s * fs)))
+
+
+def _centered_nan_windows(trace: np.ndarray, window: int) -> np.ndarray:
+    """Return centered, edge-truncated windows via NaN padding."""
+    window = max(1, int(window))
+    left = (window - 1) // 2
+    right = window - left - 1
+    padded = np.pad(trace, (left, right), constant_values=np.nan)
+    return sliding_window_view(padded, window)
+
+
+def _moving_nanmedian_1d(trace: np.ndarray, window: int) -> np.ndarray:
+    """Centered moving median that mirrors MATLAB ``medfilt1(..., 'truncate')``."""
+    windows = _centered_nan_windows(trace, window)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmedian(windows, axis=-1)
+
+
+def _moving_nanmean_1d(trace: np.ndarray, window: int) -> np.ndarray:
+    """Centered moving mean with NaN omission and edge truncation."""
+    windows = _centered_nan_windows(trace, window)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmean(windows, axis=-1)
+
+
+def _interp_linear_preserve_nan_gaps(
+    x: np.ndarray,
+    y: np.ndarray,
+    xq: np.ndarray,
+) -> np.ndarray:
+    """Interpolate over contiguous finite segments, leaving NaN gaps unfilled."""
+    out = np.full(xq.shape, np.nan, dtype=np.float64)
+    finite = np.isfinite(y)
+    if not finite.any():
+        return out
+
+    start = 0
+    while start < y.size:
+        if not finite[start]:
+            start += 1
+            continue
+
+        end = start
+        while end + 1 < y.size and finite[end + 1]:
+            end += 1
+
+        x_seg = x[start : end + 1]
+        y_seg = y[start : end + 1]
+        if x_seg.size == 1:
+            out[xq == x_seg[0]] = y_seg[0]
+        else:
+            mask = (xq >= x_seg[0]) & (xq <= x_seg[-1])
+            out[mask] = np.interp(xq[mask], x_seg, y_seg)
+
+        start = end + 1
+
+    return out
+
+
+def _safe_pchip_interp(x: np.ndarray, y: np.ndarray, xq: np.ndarray) -> np.ndarray:
+    """PCHIP interpolation with graceful fallbacks for degenerate inputs."""
+    finite = np.isfinite(y)
+    n_finite = int(finite.sum())
+    if n_finite == 0:
+        return np.full(xq.shape, np.nan, dtype=np.float64)
+    if n_finite == 1:
+        return np.full(xq.shape, y[finite][0], dtype=np.float64)
+    return PchipInterpolator(x[finite], y[finite], extrapolate=True)(xq)
+
+
+def _compute_f0_algo1_1d(
+    trace: np.ndarray,
+    denoise_window: int,
+    hull_window: int,
+) -> np.ndarray:
+    """Port of MATLAB ``computeF0(..., algo1)`` for a single 1-D trace."""
+    trace = np.asarray(trace, dtype=np.float64)
+    nan_mask = np.isnan(trace)
+    if nan_mask.all():
+        return trace.copy()
+
+    n_time = trace.size
+    hull_window = max(1, min(int(hull_window), max(1, n_time // 4)))
+    delta_des = max(4.0, denoise_window / 6.0)
+    sample_times = np.rint(
+        np.linspace(0, n_time - 1, int(np.ceil(n_time / delta_des)) + 1)
+    ).astype(int)
+    sample_times = np.unique(sample_times)
+    n_samps_in_hull = max(
+        1,
+        min(int(np.ceil(hull_window / delta_des)), sample_times.size),
+    )
+
+    f0 = _moving_nanmedian_1d(trace, denoise_window)
+
+    f00 = np.full((sample_times.size, n_samps_in_hull), np.nan, dtype=np.float64)
+    for offset in range(n_samps_in_hull):
+        xi = sample_times[offset::n_samps_in_hull]
+        if xi.size == 0:
+            continue
+        yi = f0[xi]
+        f00[:, offset] = _interp_linear_preserve_nan_gaps(xi, yi, sample_times)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        ff = np.nanmin(f00, axis=1)
+
+    doubt = np.sum(~np.isnan(f00), axis=1) < int(np.ceil(n_samps_in_hull / 2))
+    f2 = ff.copy()
+    if np.sum(~doubt) > 2:
+        f2[doubt] = np.nan
+
+    smooth_window = 2 * int(np.ceil(n_samps_in_hull / 2)) + 1
+    fill = _moving_nanmean_1d(f2, smooth_window)
+    missing = np.isnan(f2)
+    f2[missing] = fill[missing]
+    f2 = _moving_nanmean_1d(f2, smooth_window)
+
+    f0 = _safe_pchip_interp(sample_times, f2, np.arange(n_time, dtype=np.float64))
+    f0[nan_mask] = np.nan
+    return f0
+
+
+def _baseline_window_s_for_channel(channel_value: int | float) -> float:
+    """Map ScopeX channel order to the matching processSLAP2 baseline window."""
+    if int(channel_value) == 0:
+        return ROI_DFF_BASELINE_WINDOW_GLU_S
+    return ROI_DFF_BASELINE_WINDOW_CA_S
+
+
+def _safe_f0_for_division(f0: np.ndarray) -> np.ndarray:
+    """Clamp only near-zero baselines to avoid division blow-ups."""
+    safe = f0.astype(np.float64, copy=True)
+    finite = np.abs(safe[np.isfinite(safe)])
+    if finite.size == 0:
+        return safe
+
+    floor = max(_ROI_DFF_DIV_ABS_EPS, float(np.nanmedian(finite)) * _ROI_DFF_DIV_REL_EPS)
+    small = np.abs(safe) < floor
+    safe[small] = np.where(safe[small] < 0, -floor, floor)
+    return safe
+
+
+def _channel_value_for_trace(
+    roi_scopex_dataarray: xr.DataArray,
+    trace_index: tuple[int, ...],
+) -> int | float:
+    """Resolve the ScopeX channel label for one flattened trace."""
+    non_time_dims = roi_scopex_dataarray.dims[:-1]
+    if "channel" in non_time_dims:
+        channel_axis = non_time_dims.index("channel")
+        channel_values = np.asarray(roi_scopex_dataarray.coords["channel"].values)
+        return channel_values[trace_index[channel_axis]].item()
+
+    if "channel" in roi_scopex_dataarray.coords:
+        channel_values = np.asarray(roi_scopex_dataarray.coords["channel"].values)
+        if channel_values.size == 1:
+            return channel_values.reshape(()).item()
+
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -283,3 +460,97 @@ def ls_to_nonneg(
         coords=ls_scopex_dataarray.coords,
         attrs={**ls_scopex_dataarray.attrs, "trace_type": "nonneg", "tau_s": tau_s},
     )
+
+
+def roi_to_dff(
+    roi_scopex_dataarray: xr.DataArray,
+    *,
+    trace: str | None = None,
+    return_f0: bool = False,
+) -> xr.DataArray | tuple[xr.DataArray, xr.DataArray]:
+    """Convert ScopeX ROI fluorescence traces to dF/F.
+
+    This uses a trace-level port of MATLAB ``computeF0(..., algo1)`` on the
+    ROI trace itself. That is the most principled loader-side analogue for
+    user-defined ROIs, because the source-level NMF background model used to
+    compute synaptic ``F0`` is not available for ROI traces after extraction.
+
+    Parameters
+    ----------
+    roi_scopex_dataarray : xr.DataArray
+        ROI trace DataArray. ScopeX ROI stores are typically shaped
+        ``(channel, soma_id, time)``.
+    trace : str or None
+        Optional source trace label (for example ``"Fsvd"`` or ``"Fraw"``).
+        This is recorded in the output attrs for provenance only.
+    return_f0 : bool
+        If True, also return the computed baseline ``F0`` DataArray.
+
+    Returns
+    -------
+    xr.DataArray or tuple[xr.DataArray, xr.DataArray]
+        dF/F DataArray with the same dims and coordinates as the input, and
+        optionally the matching ``F0`` DataArray.
+    """
+    if "time" not in roi_scopex_dataarray.dims:
+        raise ValueError("roi_scopex_dataarray must have a 'time' dimension")
+
+    original_dims = roi_scopex_dataarray.dims
+    working = roi_scopex_dataarray
+    if working.get_axis_num("time") != working.ndim - 1:
+        working = working.transpose(
+            *[dim for dim in working.dims if dim != "time"],
+            "time",
+        )
+
+    fs = _get_fs(working)
+    denoise_window = _window_to_samples(ROI_DFF_DENOISE_WINDOW_S, fs)
+    values = np.asarray(working.values, dtype=np.float64)
+    f0_values = np.full_like(values, np.nan, dtype=np.float64)
+    dff_values = np.full_like(values, np.nan, dtype=np.float64)
+
+    non_time_shape = values.shape[:-1]
+    index_iter = np.ndindex(non_time_shape) if non_time_shape else [()]
+    for trace_index in index_iter:
+        channel_value = _channel_value_for_trace(working, trace_index)
+        baseline_window = _window_to_samples(
+            _baseline_window_s_for_channel(channel_value),
+            fs,
+        )
+        trace_values = values[trace_index]
+        trace_f0 = _compute_f0_algo1_1d(
+            trace_values,
+            denoise_window=denoise_window,
+            hull_window=baseline_window,
+        )
+        trace_f0_safe = _safe_f0_for_division(trace_f0)
+        trace_dff = (trace_values - trace_f0) / trace_f0_safe
+        trace_dff[np.isnan(trace_values)] = np.nan
+
+        f0_values[trace_index] = trace_f0
+        dff_values[trace_index] = trace_dff
+
+    base_attrs = dict(roi_scopex_dataarray.attrs)
+    if trace is not None:
+        base_attrs["source_trace"] = trace
+
+    dff_da = xr.DataArray(
+        dff_values.astype(np.float32),
+        dims=working.dims,
+        coords=working.coords,
+        attrs={**base_attrs, "signal_type": "dFF"},
+    )
+    f0_da = xr.DataArray(
+        f0_values.astype(np.float32),
+        dims=working.dims,
+        coords=working.coords,
+        attrs={**base_attrs, "signal_type": "F0"},
+    )
+
+    if working.dims != original_dims:
+        dff_da = dff_da.transpose(*original_dims)
+        f0_da = f0_da.transpose(*original_dims)
+
+    if return_f0:
+        return dff_da, f0_da
+    return dff_da

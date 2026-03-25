@@ -2045,7 +2045,7 @@ def generate_standard_synaptic_movies(
             )
     # ------------------------Generate the video for sums and soma traces-------------------------
     # save_path = os.path.join(save_to, f"glut_sums_and_somas.mp4")
-    # time_point_states = epy.hypno.hypno.get_states_fast(h, time_array)
+    # time_point_states = epy.hypno.utils.get_states_fast(h, time_array)
     # animate_traces_video(
     #    out_path=save_path,
     #    traces=traces_to_animate,
@@ -2155,7 +2155,7 @@ def generate_peripheral_trace_movie(
     traces_to_animate = [ep_data_ds, whis_data, diameter, motion, lid]
     trace_names = ["EEG", "Whisk", "Pup-Dia", "Pup-Mot", "Pup-Lid"]
     trace_colors = ["white", "#fc03ca", "#3feafc", "#3feafc", "#3feafc"]
-    time_point_states = epy.hypno.hypno.get_states_fast(h, time_array)
+    time_point_states = epy.hypno.utils.get_states_fast(h, time_array)
 
     save_path = os.path.join(save_to, "peripheral_movie.mp4")
     animate_traces_video(
