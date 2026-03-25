@@ -120,7 +120,11 @@ def syn_dF(
     merge_info: bool = True,
     apply_ephys_offset: bool = True,
 ) -> dict[str, xr.DataArray]:
-    """Load synaptic dF/F traces from scopex.
+    """Load synaptic dF (delta-F) traces from scopex.
+
+    Note: these are *not* dF/F — they are raw delta-F as output by the
+    preprocessing pipeline.  To obtain dF/F, divide by the time-varying
+    baseline returned by :func:`~wisco_slap.get.syn_F0`.
 
     Parameters
     ----------
@@ -214,6 +218,7 @@ def roi_F(
     soma_ids: Sequence[str] | None = None,
     channels: Sequence[int] | int | None = None,
     apply_ephys_offset: bool = True,
+    return_dFF: bool = False,
 ) -> dict[str, xr.DataArray]:
     """Load ROI (soma) fluorescence traces from scopex.
 
@@ -222,7 +227,10 @@ def roi_F(
     subject, exp, loc, acq : str
         Acquisition identifiers.
     trace : str
-        Trace type: ``"Fsvd"`` or ``"Fraw"``.
+        Trace type: ``"Fsvd"`` or ``"Fraw"``. ``"Fsvd"`` is the preferred
+        default for ROI dF/F because it is the lower-noise, low-rank ROI
+        estimate from processSLAP2. ``"Fraw"`` remains useful for raw/QC
+        inspection.
     dmd : int or None
         DMD number (1 or 2).  None loads both.
     soma_ids : sequence of str or None
@@ -233,6 +241,12 @@ def roi_F(
     apply_ephys_offset : bool
         If True (default), shift the ``time`` coordinate by the ephys
         offset so that times are aligned to the ephys clock.
+    return_dFF : bool
+        If True, convert the requested ROI trace to dF/F before returning it.
+        ROI dF/F is computed lazily from the loaded trace using a trace-level
+        analogue of MATLAB ``computeF0(..., algo1)`` because source-level NMF
+        ``F0`` is only available for synaptic traces, not for saved user-ROI
+        traces.
 
     Returns
     -------
@@ -250,4 +264,11 @@ def roi_F(
     )
     if apply_ephys_offset:
         result = _apply_ephys_offset(result, subject, exp, loc, acq)
+    if return_dFF:
+        from wisco_slap.scope.pro import roi_to_dff
+
+        result = {
+            key: roi_to_dff(da, trace=trace)
+            for key, da in result.items()
+        }
     return result

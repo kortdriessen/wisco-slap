@@ -52,7 +52,7 @@ def save_dF_xarrays(
     fs: float,
     traces: tuple[str, ...] = ("ls", "denoised"),
 ) -> None:
-    """Save synaptic dF/F trace xarrays as zarr stores.
+    """Save synaptic dF (delta-F) trace xarrays as zarr stores.
 
     Parameters
     ----------
