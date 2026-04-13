@@ -37,6 +37,9 @@ PARQUET_NAME: str = "glu_events_basic.parquet"
 FILTERED_ZARR_NAME: str = "filtered.zarr"
 NOISE_STD_ZARR_NAME: str = "noise_std.zarr"
 VERSION_PREFIX: str = "glu_ev_basic"
+PARQUET_DENOISED_NAME: str = "glu_events_basic_denoised.parquet"
+NOISE_STD_DENOISED_ZARR_NAME: str = "noise_std_denoised.zarr"
+VERSION_PREFIX_DENOISED: str = "glu_ev_basic_denoised"
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +262,57 @@ def match_filter_with_noise(
     )
 
 
+def rolling_mad_noise(
+    signal: xr.DataArray,
+    noise_window_s: float = DEFAULT_NOISE_WINDOW_S,
+) -> xr.Dataset:
+    """Estimate per-sample rolling MAD noise on a pre-cleaned signal trace.
+
+    Intended for the ``use_denoised`` path of :func:`detect_and_save`,
+    where the denoised trace is used directly as the detection signal
+    (no matched filter). Mirrors the noise-estimation branch of
+    :func:`match_filter_with_noise`.
+
+    Parameters
+    ----------
+    signal : xr.DataArray
+        Signal traces with dims ``(syn_id, time)``. May contain NaNs.
+    noise_window_s : float
+        Window for rolling MAD noise estimate, in seconds.
+
+    Returns
+    -------
+    xr.Dataset
+        Variable ``noise_std`` with the same dims/coords as the input.
+    """
+    time = signal.coords["time"].values
+    dt = float(np.median(np.diff(time)))
+    fs = 1.0 / dt
+
+    squeezed = signal.ndim == 1
+    if squeezed:
+        data = signal.values[np.newaxis, :].astype(np.float64)
+    else:
+        data = signal.values.astype(np.float64)
+
+    noise_win = max(3, int(np.round(noise_window_s * fs)))
+    if noise_win % 2 == 0:
+        noise_win += 1
+    noise_std, _ = _batch_rolling_mad(data, noise_win)
+
+    if squeezed:
+        noise_std = noise_std[0]
+
+    coords = {dim: signal.coords[dim] for dim in signal.dims}
+    return xr.Dataset(
+        {
+            "noise_std": xr.DataArray(
+                noise_std.astype(np.float32), dims=signal.dims, coords=coords
+            ),
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # Event extraction
 # ---------------------------------------------------------------------------
@@ -357,17 +411,32 @@ def _build_events_dataframe(all_events: list[dict]) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def _write_version_file(out_dir: str, esum_p: str) -> None:
+def _write_version_file(
+    out_dir: str, esum_p: str, prefix: str = VERSION_PREFIX
+) -> None:
     """Write a version-tracking txt file in the event_detection directory.
 
-    Removes any existing version file for this output before writing.
+    Removes any existing version file sharing the same *prefix* before
+    writing, so that running the matchfilt and denoised pipelines in the
+    same directory does not clobber each other's version files.
+
+    Parameters
+    ----------
+    out_dir : str
+        Event-detection output directory.
+    esum_p : str
+        Path to the ExperimentSummary ``.mat`` file.
+    prefix : str
+        Version-file prefix (e.g. ``VERSION_PREFIX`` for matchfilt,
+        ``VERSION_PREFIX_DENOISED`` for denoised).
     """
     esum_version = os.path.basename(esum_p).split(".mat")[0]
-    new_file = os.path.join(out_dir, f"{VERSION_PREFIX}__{esum_version}.txt")
+    new_file = os.path.join(out_dir, f"{prefix}__{esum_version}.txt")
 
-    # Remove old version files
+    # Remove old version files for this prefix only
+    target = f"{prefix}__"
     for f in os.listdir(out_dir):
-        if f.startswith(VERSION_PREFIX) and f.endswith(".txt"):
+        if f.startswith(target) and f.endswith(".txt"):
             os.remove(os.path.join(out_dir, f))
 
     with open(new_file, "w") as fh:
@@ -390,16 +459,35 @@ def detect_and_save(
     noise_window_s: float = DEFAULT_NOISE_WINDOW_S,
     min_valid_frac: float = DEFAULT_MIN_VALID_FRAC,
     snr_threshold: float = SNR_THRESHOLD,
+    use_denoised: bool = False,
 ) -> None:
     """Run basic glutamate event detection and save all outputs.
 
-    Loads LS traces from scopex zarrs, match-filters them, estimates
-    rolling noise, thresholds SNR to find active samples, groups
-    contiguous active periods into events, and saves:
+    Two modes are supported, selected via ``use_denoised``:
+
+    **Matchfilt mode** (``use_denoised=False``, default):
+    Loads LS traces, match-filters them, estimates rolling MAD noise on
+    the matched-filter output, thresholds SNR, and extracts contiguous
+    supra-threshold events. Saves:
 
     - ``glu_events_basic.parquet`` — polars DataFrame of all events
     - ``filtered.zarr`` — matched-filter output
     - ``noise_std.zarr`` — rolling MAD noise estimate
+    - ``glu_ev_basic__{esum_version}.txt`` — version tracking
+
+    **Denoised mode** (``use_denoised=True``):
+    Loads the denoised trace directly (skipping the matched filter),
+    estimates rolling MAD noise on the denoised trace, then applies the
+    identical SNR threshold and contiguous-event extraction. Saves:
+
+    - ``glu_events_basic_denoised.parquet``
+    - ``noise_std_denoised.zarr``
+    - ``glu_ev_basic_denoised__{esum_version}.txt``
+
+    The denoised mode does **not** save a filtered zarr — the denoised
+    trace is already on disk via the scopex pipeline. The two modes
+    write to disjoint filenames, so both sets of outputs can coexist in
+    the same ``event_detection/`` directory.
 
     Parameters
     ----------
@@ -410,21 +498,30 @@ def detect_and_save(
     channel : int
         Which channel to process (default 0 = iGluSnFR4f).
     tau_s : float
-        Sensor decay time constant in seconds.
+        Sensor decay time constant in seconds. Only used in matchfilt mode.
     noise_window_s : float
         Rolling MAD window in seconds.
     min_valid_frac : float
-        Minimum valid fraction for matched filter output.
+        Minimum valid fraction for matched filter output. Only used in
+        matchfilt mode.
     snr_threshold : float
         Noise multiplier for SNR threshold. Samples where
-        ``filtered / (noise_std * snr_threshold) > 1`` are active.
+        ``signal / (noise_std * snr_threshold) > 1`` are active (where
+        ``signal`` is the matched-filter output in matchfilt mode or the
+        denoised trace in denoised mode).
+    use_denoised : bool
+        If True, use the denoised trace directly as the detection signal
+        instead of match-filtering the LS trace. Default False.
     """
     tag = f"{subject} {exp} {loc} {acq}"
 
-    # Load LS traces
-    print(f"[{tag}] Loading LS traces...")
-    ls_dict = wis.get.syn_dF(
-        subject, exp, loc, acq, trace="ls", channels=channel
+    trace_name = "denoised" if use_denoised else "ls"
+    mode_label = "denoised" if use_denoised else "matchfilt"
+
+    # Load traces
+    print(f"[{tag}] Loading {trace_name} traces ({mode_label} mode)...")
+    trace_dict = wis.get.syn_dF(
+        subject, exp, loc, acq, trace=trace_name, channels=channel
     )
 
     # Set up output directory
@@ -437,54 +534,78 @@ def detect_and_save(
     filtered_xr_dict: dict[str, xr.DataArray] = {}
     noise_xr_dict: dict[str, xr.DataArray] = {}
 
-    for dmd_key, ls_da in ls_dict.items():
+    for dmd_key, trace_da in trace_dict.items():
         dmd_num = int(dmd_key.split("_")[1])
-        print(f"[{tag}] Processing {dmd_key} ({ls_da.sizes['syn_id']} synapses)...")
+        print(f"[{tag}] Processing {dmd_key} ({trace_da.sizes['syn_id']} synapses)...")
 
-        # Match filter + noise estimation
-        mfn = match_filter_with_noise(
-            ls_da, tau_s=tau_s, noise_window_s=noise_window_s,
-            min_valid_frac=min_valid_frac,
-        )
+        if use_denoised:
+            # Use the denoised trace directly as the signal; only
+            # estimate rolling MAD noise.
+            res = rolling_mad_noise(trace_da, noise_window_s=noise_window_s)
+            signal_da = trace_da
+            noise_da = res["noise_std"]
+        else:
+            # Matched filter + noise estimation
+            mfn = match_filter_with_noise(
+                trace_da, tau_s=tau_s, noise_window_s=noise_window_s,
+                min_valid_frac=min_valid_frac,
+            )
+            signal_da = mfn["filtered"]
+            noise_da = mfn["noise_std"]
 
-        filtered_vals = mfn["filtered"].values
-        noise_vals = mfn["noise_std"].values
+        signal_vals = signal_da.values
+        noise_vals = noise_da.values
 
         # Compute SNR (guard against zero noise)
         with np.errstate(divide="ignore", invalid="ignore"):
             safe_noise = np.maximum(noise_vals * snr_threshold, 1e-12)
-            snr = filtered_vals / safe_noise
+            snr = signal_vals / safe_noise
 
         # Extract events per synapse
-        time_coords = ls_da.coords["time"].values
+        time_coords = trace_da.coords["time"].values
         fs = 1.0 / float(np.median(np.diff(time_coords)))
-        syn_ids = ls_da.coords["syn_id"].values
+        syn_ids = trace_da.coords["syn_id"].values
 
         for i, sid in enumerate(syn_ids):
             events = _extract_events_for_synapse(
-                snr[i], filtered_vals[i], time_coords, fs, dmd_num, int(sid)
+                snr[i], signal_vals[i], time_coords, fs, dmd_num, int(sid)
             )
             all_events.extend(events)
 
         # Prepare zarr DataArrays: add channel dim back for save_xr_to_zarr
-        filtered_xr_dict[dmd_key] = mfn["filtered"].expand_dims("channel", axis=0)
-        noise_xr_dict[dmd_key] = mfn["noise_std"].expand_dims("channel", axis=0)
+        if not use_denoised:
+            filtered_xr_dict[dmd_key] = signal_da.expand_dims("channel", axis=0)
+        noise_xr_dict[dmd_key] = noise_da.expand_dims("channel", axis=0)
+
+    # Choose output names based on mode
+    if use_denoised:
+        parquet_name = PARQUET_DENOISED_NAME
+        noise_zarr_name = NOISE_STD_DENOISED_ZARR_NAME
+        version_prefix = VERSION_PREFIX_DENOISED
+        zarr_items: list[tuple[str, dict[str, xr.DataArray]]] = [
+            (noise_zarr_name, noise_xr_dict),
+        ]
+    else:
+        parquet_name = PARQUET_NAME
+        noise_zarr_name = NOISE_STD_ZARR_NAME
+        version_prefix = VERSION_PREFIX
+        zarr_items = [
+            (FILTERED_ZARR_NAME, filtered_xr_dict),
+            (noise_zarr_name, noise_xr_dict),
+        ]
 
     # Save events parquet
     events_df = _build_events_dataframe(all_events)
-    events_df.write_parquet(os.path.join(out_dir, PARQUET_NAME))
-    print(f"[{tag}] Saved {len(events_df)} events to {PARQUET_NAME}")
+    events_df.write_parquet(os.path.join(out_dir, parquet_name))
+    print(f"[{tag}] Saved {len(events_df)} events to {parquet_name}")
 
     # Save zarrs
-    for name, xr_dict in [
-        (FILTERED_ZARR_NAME, filtered_xr_dict),
-        (NOISE_STD_ZARR_NAME, noise_xr_dict),
-    ]:
+    for name, xr_dict in zarr_items:
         zarr_path = os.path.join(out_dir, name)
         if os.path.exists(zarr_path):
             shutil.rmtree(zarr_path)
         spy.core.xarr_summ.save_xr_to_zarr(xr_dict, zarr_path)
 
     # Write version tracking
-    _write_version_file(out_dir, esum_p)
-    print(f"[{tag}] Event detection complete.")
+    _write_version_file(out_dir, esum_p, prefix=version_prefix)
+    print(f"[{tag}] Event detection complete ({mode_label}).")

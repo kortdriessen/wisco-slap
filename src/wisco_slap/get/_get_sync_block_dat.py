@@ -11,9 +11,7 @@ from wisco_slap.defs import anmat_root
 
 def _sb_dir(subject: str, exp: str, sb: int) -> str:
     """Return the sync_block directory path."""
-    return os.path.join(
-        anmat_root, subject, exp, "sync_block_data", f"sync_block-{sb}"
-    )
+    return os.path.join(anmat_root, subject, exp, "sync_block_data", f"sync_block-{sb}")
 
 
 def ephys(
@@ -139,7 +137,36 @@ def whisk_df(subject: str, exp: str, sb: int) -> pl.DataFrame:
     pl.DataFrame
         Whisking data with columns: whis, time.
     """
-    path = os.path.join(
-        _sb_dir(subject, exp, sb), "whisking", "whisk_df.parquet"
-    )
+    path = os.path.join(_sb_dir(subject, exp, sb), "whisking", "whisk_df.parquet")
     return pl.read_parquet(path)
+
+
+def _whisk_df_to_xarray(whisk_df: pl.DataFrame) -> xr.DataArray:
+    """Convert whisking polars DataFrame to an xarray DataArray with a time dim."""
+    return xr.DataArray(
+        data=whisk_df["whis"].to_numpy(),
+        dims=["time"],
+        coords={"time": whisk_df["time"].to_numpy()},
+        name="whis",
+    )
+
+
+def whisk_xa(subject: str, exp: str, sb: int) -> xr.DataArray:
+    """Load whisking data as an xarray DataArray.
+
+    Parameters
+    ----------
+    subject : str
+        Subject name.
+    exp : str
+        Experiment name.
+    sb : int
+        Sync block number.
+
+    Returns
+    -------
+    xr.DataArray
+        DataArray with dims (time,) containing whisking values.
+    """
+    df = whisk_df(subject, exp, sb)
+    return _whisk_df_to_xarray(df)

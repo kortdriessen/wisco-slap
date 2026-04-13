@@ -22,6 +22,7 @@ dependencies = [
     "mat73>=0.65",
     "cvxpy>=1.7.3",
     "streamlit>=1.50.0",
+    "lightgbm>=4.6.0",
 ]
 
 # Dev-only deps: tools + notebooks.
