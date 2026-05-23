@@ -54,6 +54,17 @@ def get_syn_orders(
             raise FileNotFoundError(f"Proximal lines file not found: {dmp}")
         dlines = pd.read_csv(dmp)
 
+        # Prefer the explicit per-line dend-ID column written by WISynaptic's
+        # prox-lines labeler. Fall back to the historic positional mapping
+        # (line index N ↔ sorted dend_ids[N]) when the column is absent.
+        explicit_dend_map: dict[str, int] = {}
+        if "dend-ID" in dlines.columns:
+            for line_ix, sub in dlines.groupby("index"):
+                vals = sub["dend-ID"].dropna().astype(str).str.strip()
+                vals = vals[vals != ""]
+                if not vals.empty:
+                    explicit_dend_map[vals.iloc[0]] = int(line_ix)
+
         synmap = load_synapse_map(subject, exp, loc, acq, dmd, exact_values=True)
         synmap = synmap[0]
 
@@ -63,7 +74,8 @@ def get_syn_orders(
             source_ids = (
                 idf.filter(pl.col("dend-ID") == dend)["syn_id"].unique().to_numpy()
             )
-            denddf = dlines.loc[dlines["index"] == ix]
+            line_ix = explicit_dend_map.get(dend, ix)
+            denddf = dlines.loc[dlines["index"] == line_ix]
             x = denddf["axis-1"].values
             y = denddf["axis-0"].values
             dend_info[dend]["verts"] = [(x[i], y[i]) for i in range(len(x))]

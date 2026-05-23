@@ -96,15 +96,19 @@ class ScopeXAccessor:
 
     # ── Metadata coordinate filters ──────────────────────────────────
 
-    def dendid(self, dend_id: str) -> xr.DataArray:
+    def dendid(self, dend_id: str | list[str]) -> xr.DataArray:
         """Select synapse(s) belonging to a specific dendrite.
 
         Parameters
         ----------
-        dend_id : str
-            Dendrite identifier (e.g. 'G-1', 'B-2').
+        dend_id : str | list[str]
+            Dendrite identifier(s) (e.g. 'G-1', 'B-2').
         """
-        return self._obj.sel(syn_id=self._obj["dend-ID"] == dend_id)
+        if isinstance(dend_id, str):
+            if dend_id == "any":
+                return self._obj.sel(syn_id=self._obj["dend-ID"].notnull())
+            return self._obj.sel(syn_id=self._obj["dend-ID"] == dend_id)
+        return self._obj.sel(syn_id=self._obj["dend-ID"].isin(dend_id))
 
     def somaid(self, soma_id: str) -> xr.DataArray:
         """Select synapse(s) belonging to a specific soma.
@@ -124,7 +128,7 @@ class ScopeXAccessor:
         dend_type : str
             Dendrite type label.
         """
-        return self._obj.sel(syn_id=self._obj["dend-type"] == dend_type)
+        return self._obj.sel(syn_id=self._obj["dend_type"] == dend_type)
 
     def syntype(self, synapse_type: str) -> xr.DataArray:
         """Select synapse(s) by synapse type.

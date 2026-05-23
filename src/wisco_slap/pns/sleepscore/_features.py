@@ -23,6 +23,134 @@ from ._utils import segment_indices
 # Low-level helpers
 # ---------------------------------------------------------------------------
 
+PUPIL_FEATURE_NAMES: list[str] = [
+    "pu_diam_mean",
+    "pu_diam_std",
+    "pu_diam_iqr",
+    "pu_vel_absmean",
+    "pu_vel_std",
+    "pu_motion_mean",
+    "pu_motion_std",
+    "pu_eyelid_mean",
+    "pu_eyelid_std",
+    "pu_eyelid_norm_mean",
+    "pu_constriction_rate",
+    "pu_eye_closure_frac",
+]
+
+WHISK_FEATURE_NAMES: list[str] = [
+    "whisk_mean",
+    "whisk_std",
+    "whisk_iqr",
+    "whisk_active_frac",
+    "whisk_burst_count",
+]
+
+
+def _missing_feature_map(names: list[str]) -> dict[str, None]:
+    """Return a feature dict with null values."""
+    return {name: None for name in names}
+
+
+def _safe_iqr(x: np.ndarray) -> float | None:
+    """Return the IQR of finite values, or ``None`` if not enough samples exist."""
+    valid = x[np.isfinite(x)]
+    if valid.size < 5:
+        return 0.0 if valid.size > 0 else None
+    return float(iqr(valid))
+
+
+def _safe_quantile(x: np.ndarray, q: float, *, default: float = 0.0) -> float:
+    """Return a finite quantile or *default* if unavailable."""
+    valid = x[np.isfinite(x)]
+    if valid.size == 0:
+        return default
+    return float(np.quantile(valid, q))
+
+
+def _fraction(mask: np.ndarray) -> float:
+    """Return the mean of a boolean mask, defaulting to 0 for empty arrays."""
+    return float(mask.mean()) if mask.size > 0 else 0.0
+
+
+def _coerce_pupil_array(
+    pupil: dict,
+    key: str,
+    *,
+    length: int,
+    default: float,
+) -> np.ndarray:
+    """Return a float array of the expected length for one pupil-field."""
+    values = pupil.get(key, None)
+    if values is None:
+        return np.full(length, default, dtype=float)
+    arr = np.asarray(values, dtype=float)
+    if arr.shape[0] != length:
+        raise ValueError(
+            f"Pupil field '{key}' has length {arr.shape[0]}, expected {length}."
+        )
+    return arr
+
+
+def _build_video_quality_masks(
+    pupil: dict,
+    config: ScoreConfig,
+) -> dict[str, np.ndarray]:
+    """Compute per-frame validity masks for pupil, eyelid, whisking, and camera-off."""
+    ts = np.asarray(pupil["timestamps"], dtype=float)
+    n_frames = len(ts)
+    diameter = _coerce_pupil_array(pupil, "diameter", length=n_frames, default=np.nan)
+    motion = _coerce_pupil_array(pupil, "motion", length=n_frames, default=np.nan)
+    eyelid = _coerce_pupil_array(pupil, "eyelid", length=n_frames, default=np.nan)
+    eyelid_norm = _coerce_pupil_array(pupil, "eyelid_norm", length=n_frames, default=np.nan)
+    whisking = _coerce_pupil_array(pupil, "whisking", length=n_frames, default=np.nan)
+    pup_likelihood = _coerce_pupil_array(
+        pupil, "pup_likelihood", length=n_frames, default=1.0
+    )
+    lid_likelihood = _coerce_pupil_array(
+        pupil, "lid_likelihood", length=n_frames, default=1.0
+    )
+
+    vcfg = config.video_quality
+    whisk_floor = _safe_quantile(
+        whisking,
+        vcfg.camera_off_whisk_quantile,
+        default=0.0,
+    )
+
+    pup_lh_clean = np.nan_to_num(pup_likelihood, nan=0.0, posinf=1.0, neginf=0.0)
+    lid_lh_clean = np.nan_to_num(lid_likelihood, nan=0.0, posinf=1.0, neginf=0.0)
+    whisk_clean = np.nan_to_num(whisking, nan=-np.inf, neginf=-np.inf, posinf=np.inf)
+
+    camera_off_frame = (
+        (pup_lh_clean <= vcfg.camera_off_likelihood_max)
+        & (lid_lh_clean <= vcfg.camera_off_likelihood_max)
+        & (whisk_clean <= whisk_floor)
+    )
+    pupil_valid = (
+        (pup_lh_clean >= vcfg.pupil_valid_likelihood_min)
+        & np.isfinite(diameter)
+    )
+    pupil_motion_valid = pupil_valid & np.isfinite(motion)
+    if pupil_motion_valid.size > 0:
+        pupil_motion_valid[0] = False
+        pupil_motion_valid[1:] = pupil_motion_valid[1:] & pupil_valid[:-1]
+
+    eyelid_valid = (
+        (lid_lh_clean >= vcfg.eyelid_valid_likelihood_min)
+        & np.isfinite(eyelid)
+        & np.isfinite(eyelid_norm)
+    )
+    whisk_valid = (~camera_off_frame) & np.isfinite(whisking)
+
+    return {
+        "pupil_valid": pupil_valid,
+        "pupil_motion_valid": pupil_motion_valid,
+        "eyelid_valid": eyelid_valid,
+        "whisk_valid": whisk_valid,
+        "camera_off_frame": camera_off_frame,
+    }
+
 
 def _bandpower_from_welch(
     x: np.ndarray,
@@ -39,13 +167,15 @@ def _bandpower_from_welch(
     Pxx : power spectral density.
     """
     if nperseg is None:
-        nperseg = min(int(fs * 2), 512)
-        nperseg = max(nperseg, 64)
-    f, Pxx = welch(x, fs=fs, nperseg=nperseg, noverlap=nperseg // 2)
+        nperseg = min(int(fs * 2), 512, len(x))
+        nperseg = max(nperseg, min(len(x), 64))
+    nperseg = min(nperseg, len(x))
+    noverlap = min(nperseg // 2, max(nperseg - 1, 0))
+    f, Pxx = welch(x, fs=fs, nperseg=nperseg, noverlap=noverlap)
     powers: dict[str, float] = {}
     for name, f0, f1 in bands:
         m = (f >= f0) & (f < f1)
-        bp = float(np.trapz(Pxx[m], f[m])) if np.any(m) else 0.0
+        bp = float(np.trapezoid(Pxx[m], f[m])) if np.any(m) else 0.0
         powers[name] = math.log(bp + 1e-12)
     return powers, f, Pxx
 
@@ -87,9 +217,9 @@ def _extract_eeg_features_for_epoch(
     t1: float,
     feature_windows_s: list[float],
     epoch_len_s: float,
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     """Extract EEG features at multiple resolutions for a single epoch centered at (t0+t1)/2."""
-    feats: dict[str, float] = {}
+    feats: dict[str, float | None] = {}
     center = (t0 + t1) / 2.0
 
     for win_s in feature_windows_s:
@@ -102,17 +232,18 @@ def _extract_eeg_features_for_epoch(
 
         min_samples = max(int(0.5 * fs_eeg * win_s), 8)
         if len(xe) < min_samples:
-            # Insufficient coverage — fill NaN
+            # Insufficient coverage — fill with nulls so downstream context/scaling
+            # preserves missingness rather than propagating NaN.
             bands = EEG_BANDS_1S if win_s <= 1.0 else EEG_BANDS_LONG
             for name, _, _ in bands:
-                feats[f"eeg_{name}_{tag}"] = float("nan")
+                feats[f"eeg_{name}_{tag}"] = None
             if win_s <= 1.0:
                 for ratio_name in [
                     "theta_delta", "theta_sigma", "beta_delta",
                     "ugamma_delta", "spec_entropy", "spec_edge_95",
                     "line_length",
                 ]:
-                    feats[f"eeg_{ratio_name}_{tag}"] = float("nan")
+                    feats[f"eeg_{ratio_name}_{tag}"] = None
             continue
 
         bands = EEG_BANDS_1S if win_s <= 1.0 else EEG_BANDS_LONG
@@ -142,97 +273,118 @@ def _extract_eeg_features_for_epoch(
 
 def _extract_pupil_features_for_epoch(
     pupil: dict,
-    t0: float,
-    t1: float,
+    quality_masks: dict[str, np.ndarray],
+    sl: slice,
+    ts: np.ndarray,
     fs_pu: float,
     epoch_len_s: float,
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     """Extract pupil/eyelid features for one epoch."""
-    feats: dict[str, float] = {}
-    ts = pupil["timestamps"]
-    sl = segment_indices(ts, t0, t1)
-
     xd = pupil["diameter"][sl]
     xm = pupil["motion"][sl]
     xe = pupil["eyelid"][sl]
     xen = pupil["eyelid_norm"][sl]
+    xt = ts[sl]
+
+    pupil_valid = quality_masks["pupil_valid"][sl]
+    pupil_motion_valid = quality_masks["pupil_motion_valid"][sl]
+    eyelid_valid = quality_masks["eyelid_valid"][sl]
+
+    feats: dict[str, float | None] = {}
+    feats.update(_missing_feature_map(PUPIL_FEATURE_NAMES))
 
     min_samples = max(int(0.5 * fs_pu * epoch_len_s), 2)
-    if len(xd) < min_samples:
-        for k in [
-            "pu_diam_mean", "pu_diam_std", "pu_diam_iqr",
-            "pu_vel_absmean", "pu_vel_std",
-            "pu_motion_mean", "pu_motion_std",
-            "pu_eyelid_mean", "pu_eyelid_std",
-            "pu_eyelid_norm_mean",
-            "pu_constriction_rate",
-            "pu_eye_closure_frac",
-        ]:
-            feats[k] = float("nan")
-        return feats
+    xd_valid = xd[pupil_valid]
+    xt_valid = xt[pupil_valid]
+    xm_valid = xm[pupil_motion_valid]
+    xe_valid = xe[eyelid_valid]
+    xen_valid = xen[eyelid_valid]
 
-    dt = 1.0 / fs_pu
-    vel = np.diff(xd) / dt if len(xd) > 1 else np.array([0.0])
+    if xd_valid.size >= min_samples:
+        feats["pu_diam_mean"] = float(np.mean(xd_valid))
+        feats["pu_diam_std"] = float(np.std(xd_valid))
+        feats["pu_diam_iqr"] = _safe_iqr(xd_valid)
 
-    feats["pu_diam_mean"] = float(np.nanmean(xd))
-    feats["pu_diam_std"] = float(np.nanstd(xd))
-    feats["pu_diam_iqr"] = float(iqr(xd[~np.isnan(xd)])) if np.sum(~np.isnan(xd)) > 4 else 0.0
-    feats["pu_vel_absmean"] = float(np.nanmean(np.abs(vel)))
-    feats["pu_vel_std"] = float(np.nanstd(vel))
-    feats["pu_motion_mean"] = float(np.nanmean(xm))
-    feats["pu_motion_std"] = float(np.nanstd(xm))
-    feats["pu_eyelid_mean"] = float(np.nanmean(xe))
-    feats["pu_eyelid_std"] = float(np.nanstd(xe))
-    feats["pu_eyelid_norm_mean"] = float(np.nanmean(xen))
+        if xd_valid.size > 1:
+            dt = np.diff(xt_valid)
+            dx = np.diff(xd_valid)
+            valid_dt = dt > 0
+            vel = dx[valid_dt] / dt[valid_dt]
+        else:
+            vel = np.array([0.0], dtype=float)
 
-    # Constriction rate: fraction of velocity samples that are negative (pupil shrinking)
-    feats["pu_constriction_rate"] = float(np.mean(vel < 0)) if len(vel) > 0 else 0.5
+        if vel.size > 0:
+            feats["pu_vel_absmean"] = float(np.mean(np.abs(vel)))
+            feats["pu_vel_std"] = float(np.std(vel))
+            feats["pu_constriction_rate"] = float(np.mean(vel < 0))
 
-    # Eye closure fraction: fraction of epoch where normalized eyelid is below threshold
-    # Threshold of 0.3 is empirical — means eyelid is ~30% of maximum openness
-    valid_en = xen[~np.isnan(xen)]
-    if len(valid_en) > 0:
-        feats["pu_eye_closure_frac"] = float(np.mean(valid_en < 0.3))
-    else:
-        feats["pu_eye_closure_frac"] = float("nan")
+    if xm_valid.size >= min_samples:
+        feats["pu_motion_mean"] = float(np.mean(xm_valid))
+        feats["pu_motion_std"] = float(np.std(xm_valid))
+
+    if xe_valid.size >= min_samples:
+        feats["pu_eyelid_mean"] = float(np.mean(xe_valid))
+        feats["pu_eyelid_std"] = float(np.std(xe_valid))
+        feats["pu_eyelid_norm_mean"] = float(np.mean(xen_valid))
+        feats["pu_eye_closure_frac"] = float(np.mean(xen_valid < 0.3))
 
     return feats
 
 
 def _extract_whisking_features_for_epoch(
     pupil: dict,
-    t0: float,
-    t1: float,
+    quality_masks: dict[str, np.ndarray],
+    sl: slice,
     fs_pu: float,
     epoch_len_s: float,
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     """Extract whisking features for one epoch."""
-    feats: dict[str, float] = {}
-    ts = pupil["timestamps"]
-    sl = segment_indices(ts, t0, t1)
     xw = pupil["whisking"][sl]
+    whisk_valid = quality_masks["whisk_valid"][sl]
+    xw_valid = xw[whisk_valid]
+
+    feats: dict[str, float | None] = {}
+    feats.update(_missing_feature_map(WHISK_FEATURE_NAMES))
 
     min_samples = max(int(0.5 * fs_pu * epoch_len_s), 2)
-    if len(xw) < min_samples:
-        for k in ["whisk_mean", "whisk_std", "whisk_iqr", "whisk_active_frac", "whisk_burst_count"]:
-            feats[k] = float("nan")
+    if xw_valid.size < min_samples:
         return feats
 
-    feats["whisk_mean"] = float(np.nanmean(xw))
-    feats["whisk_std"] = float(np.nanstd(xw))
-    feats["whisk_iqr"] = float(iqr(xw[~np.isnan(xw)])) if np.sum(~np.isnan(xw)) > 4 else 0.0
+    feats["whisk_mean"] = float(np.mean(xw_valid))
+    feats["whisk_std"] = float(np.std(xw_valid))
+    feats["whisk_iqr"] = _safe_iqr(xw_valid)
 
     # Active fraction: above 3 * MAD threshold
-    wmad = float(np.median(np.abs(xw - np.median(xw)))) + 1e-9
-    threshold = np.median(xw) + 3.0 * wmad
-    feats["whisk_active_frac"] = float(np.mean(xw > threshold))
+    wmed = float(np.median(xw_valid))
+    wmad = float(np.median(np.abs(xw_valid - wmed))) + 1e-9
+    threshold = wmed + 3.0 * wmad
+    feats["whisk_active_frac"] = float(np.mean(xw_valid > threshold))
 
     # Burst count: number of upward threshold crossings
-    above = xw > threshold
+    above = xw_valid > threshold
     crossings = np.diff(above.astype(int))
     feats["whisk_burst_count"] = float(np.sum(crossings == 1))
 
     return feats
+
+
+def _extract_video_quality_features_for_epoch(
+    quality_masks: dict[str, np.ndarray],
+    sl: slice,
+    config: ScoreConfig,
+) -> dict[str, float]:
+    """Summarize video validity and camera-off fractions for one epoch."""
+    camera_off = quality_masks["camera_off_frame"][sl]
+    camera_off_frac = _fraction(camera_off)
+    return {
+        "pu_valid_frac": _fraction(quality_masks["pupil_valid"][sl]),
+        "eyelid_valid_frac": _fraction(quality_masks["eyelid_valid"][sl]),
+        "whisk_valid_frac": _fraction(quality_masks["whisk_valid"][sl]),
+        "camera_off_frac": camera_off_frac,
+        "camera_off_epoch": float(
+            camera_off_frac >= config.video_quality.camera_off_min_frame_frac
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -263,10 +415,13 @@ def extract_features_for_session(
     fs_eeg = float(eeg["fs"])
     fs_pu = float(pupil["fs"])
     epoch_len_s = config.epoch_len_s
+    ts_pu = np.asarray(pupil["timestamps"], dtype=float)
+    quality_masks = _build_video_quality_masks(pupil, config)
 
     rows: list[dict] = []
     for ei in range(len(edges) - 1):
         t0, t1 = float(edges[ei]), float(edges[ei + 1])
+        sl = segment_indices(ts_pu, t0, t1)
         row: dict = {
             "session_id": sid,
             "epoch_idx": ei,
@@ -282,16 +437,21 @@ def extract_features_for_session(
         row.update(eeg_feats)
 
         # Pupil features
-        pu_feats = _extract_pupil_features_for_epoch(pupil, t0, t1, fs_pu, epoch_len_s)
+        pu_feats = _extract_pupil_features_for_epoch(
+            pupil, quality_masks, sl, ts_pu, fs_pu, epoch_len_s
+        )
         row.update(pu_feats)
 
         # Whisking features
-        wh_feats = _extract_whisking_features_for_epoch(pupil, t0, t1, fs_pu, epoch_len_s)
+        wh_feats = _extract_whisking_features_for_epoch(
+            pupil, quality_masks, sl, fs_pu, epoch_len_s
+        )
         row.update(wh_feats)
+        row.update(_extract_video_quality_features_for_epoch(quality_masks, sl, config))
 
         rows.append(row)
 
-    df = pl.DataFrame(rows)
+    df = pl.DataFrame(rows, infer_schema_length=None)
     return df
 
 
@@ -331,22 +491,30 @@ def add_context_features(
 
     for feat in key_features:
         for win in context_windows:
-            min_periods = max(3, win // 3)
+            min_samples = max(3, win // 3)
             # Rolling mean
             col_name = f"{feat}_ctx{win}_mean"
             df = df.with_columns(
-                pl.col(feat)
-                .rolling_mean(window_size=win, min_periods=min_periods, center=True)
-                .over(session_col)
+                pl.when(pl.col(feat).is_not_null())
+                .then(
+                    pl.col(feat)
+                    .rolling_mean(window_size=win, min_samples=min_samples, center=True)
+                    .over(session_col)
+                )
+                .otherwise(None)
                 .alias(col_name)
             )
             # Rolling std for short window only
             if win == context_windows[0]:
                 col_name_std = f"{feat}_ctx{win}_std"
                 df = df.with_columns(
-                    pl.col(feat)
-                    .rolling_std(window_size=win, min_periods=min_periods, center=True)
-                    .over(session_col)
+                    pl.when(pl.col(feat).is_not_null())
+                    .then(
+                        pl.col(feat)
+                        .rolling_std(window_size=win, min_samples=min_samples, center=True)
+                        .over(session_col)
+                    )
+                    .otherwise(None)
                     .alias(col_name_std)
                 )
 

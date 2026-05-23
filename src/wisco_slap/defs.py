@@ -7,6 +7,7 @@ import os
 data_root: str = (
     "/run/user/1329238735/gvfs/smb-share:server=tononi-nas,share=slap_mi/slap_mi/data"
 )
+ssh_data_root = "slapmi@tononi-nas:/mnt/pool1/tononi_volume10/slap_mi/data"
 # root of the analysis directory, local
 anmat_root: str = "/data/slap_analysis/analysis_materials"
 # -------------------------------------------------------------

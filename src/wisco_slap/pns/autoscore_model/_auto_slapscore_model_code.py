@@ -130,7 +130,7 @@ def _bandpower_from_welch(
     band_powers = []
     for f0, f1 in bands:
         m = (f >= f0) & (f < f1)
-        band_powers.append(float(np.trapz(Pxx[m], f[m]) if np.any(m) else 0.0))
+        band_powers.append(float(np.trapezoid(Pxx[m], f[m]) if np.any(m) else 0.0))
     return np.array(band_powers, dtype=float), Pxx
 
 

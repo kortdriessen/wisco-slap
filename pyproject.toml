@@ -11,6 +11,7 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "slap2-py",
     "electro-py",
+    "kplot",
     "tqdm>=4.67.1",
     "pillow>=11.3.0",
     "scikit-learn>=1.7.2",
@@ -23,6 +24,7 @@ dependencies = [
     "cvxpy>=1.7.3",
     "streamlit>=1.50.0",
     "lightgbm>=4.6.0",
+    "statsmodels>=0.14.6",
 ]
 
 # Dev-only deps: tools + notebooks.
@@ -40,6 +42,7 @@ build-backend = "hatchling.build"
 [tool.uv.sources]
 slap2-py = { path = "../slap2-py", editable = true }
 electro-py = { path = "../electro-py", editable = true }
+kplot = { path = "../kplot", editable = true }
 
 # Build one wheel that contains the import package.
 [tool.hatch.build.targets.wheel]

@@ -155,18 +155,44 @@ def build_hsmm_components(
     if state_names is None:
         state_names = STATE_NAMES
     S = len(state_names)
+    state_to_idx = {name: idx for idx, name in enumerate(state_names)}
+
+    allow_self_transitions = bool(
+        getattr(hsmm_cfg, "allow_self_transitions", False)
+    )
+    transition_log_adjustments = getattr(
+        hsmm_cfg,
+        "transition_log_adjustments",
+        {("Wake", "REM"): -8.0, ("REM", "NREM"): -8.0},
+    )
 
     # Transition matrix: small base probability for transitions, high for self-loops
     logA = np.full((S, S), math.log(1e-6), dtype=float)
     for s in range(S):
         for sp in range(S):
             if s == sp:
-                logA[s, sp] = math.log(0.90) + hsmm_cfg.stay_bonus
+                if allow_self_transitions:
+                    logA[s, sp] = math.log(0.90) + hsmm_cfg.stay_bonus
+                else:
+                    logA[s, sp] = -np.inf
             else:
                 logA[s, sp] = math.log(0.05) + hsmm_cfg.change_penalty
 
+    for (from_state, to_state), adjustment in transition_log_adjustments.items():
+        if from_state not in state_to_idx or to_state not in state_to_idx:
+            raise ValueError(
+                "HSMM transition_log_adjustments contains unknown state pair "
+                f"{(from_state, to_state)!r}; valid states are {state_names}."
+            )
+        logA[state_to_idx[from_state], state_to_idx[to_state]] += float(adjustment)
+
     # Normalize rows
     row_logsum = np.logaddexp.reduce(logA, axis=1)
+    if not np.all(np.isfinite(row_logsum)):
+        raise ValueError(
+            "HSMM transition matrix has at least one state with no legal outgoing "
+            "transitions. Check allow_self_transitions and transition_log_adjustments."
+        )
     logA = logA - row_logsum[:, None]
 
     # Uniform initial

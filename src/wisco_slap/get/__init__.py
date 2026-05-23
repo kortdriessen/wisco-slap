@@ -1,6 +1,5 @@
 """Convenience loading functions, accessible as ``wis.get.<function>(...)``."""
 
-from ._annotations import hypno_csv as hypno_csv
 from ._get_event_detection import denoised_noise_std as denoised_noise_std
 from ._get_event_detection import glu_events_basic as glu_events_basic
 from ._get_event_detection import (
@@ -8,6 +7,9 @@ from ._get_event_detection import (
 )
 from ._get_event_detection import matchFilt_noise_std as matchFilt_noise_std
 from ._get_event_detection import matchFilt_traces as matchFilt_traces
+from ._get_hypnos import acq_sleep_coverage as acq_sleep_coverage
+from ._get_hypnos import bout_hypno as bout_hypno
+from ._get_hypnos import hypno_csv as hypno_csv
 from ._get_scopex import merge_syn_info_to_scopex as merge_syn_info_to_scopex
 from ._get_scopex import roi_F as roi_F
 from ._get_scopex import syn_dF as syn_dF
@@ -19,6 +21,7 @@ from ._get_sync_block_dat import eye_metrics_xa as eye_metrics_xa
 from ._get_sync_block_dat import frame_times as frame_times
 from ._get_sync_block_dat import whisk_df as whisk_df
 from ._get_sync_block_dat import whisk_xa as whisk_xa
+from ._utils import combine_scopex_arrays as combine_scopex_arrays
 
 __all__ = [
     "denoised_noise_std",
@@ -38,4 +41,7 @@ __all__ = [
     "whisk_df",
     "whisk_xa",
     "hypno_csv",
+    "bout_hypno",
+    "acq_sleep_coverage",
+    "combine_scopex_arrays",
 ]

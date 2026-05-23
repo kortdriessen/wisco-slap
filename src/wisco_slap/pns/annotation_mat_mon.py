@@ -243,6 +243,8 @@ def _required_canvas_paths(acq_root: Path) -> tuple[Path, ...]:
         acq_root / "canvas" / "DMD-2.png",
         acq_root / "canvas" / "syn_overlays" / "DMD-1.png",
         acq_root / "canvas" / "syn_overlays" / "DMD-2.png",
+        acq_root / "canvas" / "activity_image" / "DMD-1.npy",
+        acq_root / "canvas" / "activity_image" / "DMD-2.npy",
     )
 
 
@@ -525,9 +527,6 @@ def _archive_stale_synapse_sidecars(acq_root: Path) -> list[str]:
     for path in sorted(acq_root.glob("synapse_ids/dmd-*/synapse_labels.csv")):
         actions.append(_archive_file(path, backup_root, acq_root))
 
-    for path in sorted(acq_root.glob("source_sorting/syn_topo_dmd*.json")):
-        actions.append(_archive_file(path, backup_root, acq_root))
-
     return actions
 
 
@@ -568,12 +567,13 @@ def _render_actions(audit: AnnotationAcqAudit, overwrite: bool) -> tuple[str, ..
         actions.append("create missing materials.txt / notes.md")
 
     if _component_needs_rebuild(audit.canvas_status, overwrite):
-        actions.append("regenerate canvas images and synapse overlays")
+        actions.append(
+            "regenerate canvas images, synapse overlays, and activity arrays"
+        )
 
     if _component_needs_rebuild(audit.synapse_ids_status, overwrite):
         if audit.synapse_ids_status == "stale":
             actions.append("archive stale synapse_labels.csv files")
-            actions.append("archive stale syn_topo_dmd*.json files")
         actions.append(
             "rebuild synapse_ids numeric PNGs, master_image.png, "
             "and source_location_key.npz"
@@ -801,7 +801,7 @@ def acq_data(
     acq_root = _acq_dir(subject, exp, loc, acq)
 
     if _component_needs_rebuild(audit.canvas_status, overwrite):
-        annotation_materials.save_acq_mean_images(
+        annotation_materials.save_acq_canvas_images(
             subject,
             exp,
             loc,

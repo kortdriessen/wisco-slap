@@ -11,7 +11,10 @@ from wisco_slap.meta.get import esum_mirror_path
 def _update_dmd_info(subject, exp, loc, acq):
     dmd_info_path = f"{DEFS.anmat_root}/dmd_info.yaml"
     esum_path = esum_mirror_path(subject, exp, loc, acq)
-    if esum_path is None:
+    # esum_mirror_path can return either None or the sentinel string
+    # "NO_ESUM_MIRROR" when no .mat has been mirrored yet. In both
+    # cases we have nothing to read, so this acq is a no-op.
+    if esum_path is None or esum_path == "NO_ESUM_MIRROR":
         print(f"{subject} {exp} {loc} {acq} has no esum path")
         return None
     with open(dmd_info_path) as f:
@@ -32,7 +35,9 @@ def _update_dmd_info(subject, exp, loc, acq):
         dmd_info[subject][exp][loc][acq]["dmd-2"]["depth"] = -1
     for dmd in [1, 2]:
         roi = get_roi_list(esum_path, dmd)
-        if roi[0] == 0:
+        if roi == []:
+            dmd_info[subject][exp][loc][acq][f"dmd-{dmd}"]["somas"] = []
+        elif roi[0] == 0:
             dmd_info[subject][exp][loc][acq][f"dmd-{dmd}"]["somas"] = []
         else:
             roi_names = []

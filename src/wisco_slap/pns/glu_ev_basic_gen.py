@@ -416,9 +416,12 @@ def _write_version_file(
 ) -> None:
     """Write a version-tracking txt file in the event_detection directory.
 
-    Removes any existing version file sharing the same *prefix* before
-    writing, so that running the matchfilt and denoised pipelines in the
-    same directory does not clobber each other's version files.
+    File is named ``{prefix}__{esum_version}.txt`` and its contents are the
+    same ``esum_version`` on one line (matching the scopex and annotation
+    marker conventions). Removes any existing version file sharing the
+    same *prefix* before writing, so that running the matchfilt and
+    denoised pipelines in the same directory does not clobber each
+    other's version files.
 
     Parameters
     ----------
@@ -440,7 +443,7 @@ def _write_version_file(
             os.remove(os.path.join(out_dir, f))
 
     with open(new_file, "w") as fh:
-        fh.write(esum_p)
+        fh.write(f"{esum_version}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -518,10 +521,13 @@ def detect_and_save(
     trace_name = "denoised" if use_denoised else "ls"
     mode_label = "denoised" if use_denoised else "matchfilt"
 
-    # Load traces
+    # Load traces. Events parquet and sibling zarrs are written on the
+    # trial clock (offset NOT applied); readers shift to the TDT clock via
+    # apply_ephys_offset=True, which is their default.
     print(f"[{tag}] Loading {trace_name} traces ({mode_label} mode)...")
     trace_dict = wis.get.syn_dF(
-        subject, exp, loc, acq, trace=trace_name, channels=channel
+        subject, exp, loc, acq, trace=trace_name, channels=channel,
+        apply_ephys_offset=False,
     )
 
     # Set up output directory

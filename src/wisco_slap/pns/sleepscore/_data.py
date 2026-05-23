@@ -73,6 +73,16 @@ def create_session(
         "motion": eye["motion"].to_numpy(),
         "eyelid": eye["lid"].to_numpy(),
         "eyelid_norm": eye["lid_norm"].to_numpy(),
+        "pup_likelihood": (
+            eye["pup_likelihood"].to_numpy()
+            if "pup_likelihood" in eye.columns
+            else np.ones(len(eye), dtype=float)
+        ),
+        "lid_likelihood": (
+            eye["lid_likelihood"].to_numpy()
+            if "lid_likelihood" in eye.columns
+            else np.ones(len(eye), dtype=float)
+        ),
         "whisking": whis["whis"].to_numpy(),
         "timestamps": vid_timestamps,
         "fs": 10.0,
@@ -114,21 +124,21 @@ _LABEL_MAPPING: dict[str, str] = {
     "NREM_SPINDLE": "NREM",
     "NR": "NREM",
     "SWS": "NREM",
-    "IS": "IS",
-    "INTERMEDIATE_STATE": "IS",
-    "INTERMEDIATE": "IS",
     "REM": "REM",
     "REM_PHASIC": "REM",
     "R": "REM",
     "WAKE": "Wake",
     "WAKE_QUIET": "Wake",
     "WAKE_BRIEF_AROUSAL": "Wake",
+    "ARTIFACT": "Wake",
     "W": "Wake",
 }
 
+_OBSOLETE_LABELS: set[str] = {"IS", "INTERMEDIATE_STATE", "INTERMEDIATE"}
+
 
 def validate_and_standardize_labels(df: pl.DataFrame) -> pl.DataFrame:
-    """Standardize label names and filter to recognized states.
+    """Standardize label names and reject obsolete or unknown labels.
 
     Parameters
     ----------
@@ -136,7 +146,7 @@ def validate_and_standardize_labels(df: pl.DataFrame) -> pl.DataFrame:
 
     Returns
     -------
-    Cleaned DataFrame with only recognized labels, sorted by time.
+    Cleaned DataFrame with canonical labels, sorted by time.
     """
     required = {"start_s", "end_s", "label"}
     if not required.issubset(set(df.columns)):
@@ -144,19 +154,63 @@ def validate_and_standardize_labels(df: pl.DataFrame) -> pl.DataFrame:
 
     df = df.sort("start_s", "end_s")
 
-    # Uppercase + strip, then map
-    df = df.with_columns(
-        pl.col("label").str.to_uppercase().str.strip_chars().alias("label")
-    )
-    # Apply mapping
-    mapping_expr = pl.col("label")
-    for raw, canonical in _LABEL_MAPPING.items():
-        mapping_expr = pl.when(pl.col("label") == raw).then(pl.lit(canonical)).otherwise(mapping_expr)
+    raw_source_col = "raw_label" if "raw_label" in df.columns else "label"
+    raw_labels = [
+        "" if label is None else str(label).strip()
+        for label in df.get_column(raw_source_col).to_list()
+    ]
+    normalized_labels = [label.upper() for label in raw_labels]
 
-    df = df.with_columns(mapping_expr.alias("label"))
-    # Keep only recognized states
-    df = df.filter(pl.col("label").is_in(STATE_NAMES))
-    return df
+    unknown_labels = sorted({label for label in normalized_labels if label not in _LABEL_MAPPING})
+    if unknown_labels:
+        obsolete_labels = [label for label in unknown_labels if label in _OBSOLETE_LABELS]
+        unsupported_labels = [
+            label for label in unknown_labels if label not in _OBSOLETE_LABELS
+        ]
+        parts: list[str] = []
+        if obsolete_labels:
+            parts.append(
+                f"obsolete labels are not supported anymore: {obsolete_labels}"
+            )
+        if unsupported_labels:
+            parts.append(f"unknown labels: {unsupported_labels}")
+        raise ValueError(
+            "Unrecognized sleep labels in training data ("
+            + "; ".join(parts)
+            + "). Supported aliases map to canonical states "
+            f"{STATE_NAMES}."
+        )
+
+    mapped_labels = [_LABEL_MAPPING[label] for label in normalized_labels]
+    return df.with_columns(
+        pl.Series("raw_label", raw_labels),
+        pl.Series("label", mapped_labels),
+    )
+
+
+def prepare_training_labels(
+    labels_df: pl.DataFrame | None,
+    *,
+    exclude_artifact: bool = False,
+) -> pl.DataFrame | None:
+    """Return labels for classifier training, optionally dropping Artifact intervals."""
+    if labels_df is None or labels_df.is_empty() or not exclude_artifact:
+        return labels_df
+
+    if "raw_label" not in labels_df.columns:
+        raise ValueError(
+            "exclude_artifact=True requires labels with a 'raw_label' column. "
+            "Reload labels with load_labels_csv(...) or validate_and_standardize_labels(...)."
+        )
+
+    raw_label = (
+        pl.col("raw_label")
+        .cast(pl.String)
+        .str.strip_chars()
+        .str.to_uppercase()
+        .fill_null("")
+    )
+    return labels_df.filter(raw_label != "ARTIFACT")
 
 
 def load_labels_csv(path: str) -> pl.DataFrame:

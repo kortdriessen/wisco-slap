@@ -6,6 +6,11 @@ import numpy as np
 import polars as pl
 
 
+def _is_missing_scale_value(value: float | None) -> bool:
+    """Return True when a median/quantile result cannot be used for scaling."""
+    return value is None or not np.isfinite(float(value))
+
+
 def robust_scale_per_session(
     df: pl.DataFrame,
     feature_cols: list[str],
@@ -28,13 +33,22 @@ def robust_scale_per_session(
         scaled = group.clone()
         for col in feature_cols:
             vals = scaled[col]
+            if vals.dtype == pl.Null or vals.null_count() == len(vals):
+                scaled = scaled.with_columns(pl.col(col).cast(pl.Float64).alias(col))
+                continue
+
             med = vals.median()
             q75 = vals.quantile(0.75)
             q25 = vals.quantile(0.25)
-            iqr_val = q75 - q25 if (q75 is not None and q25 is not None) else None
-            if iqr_val is None or iqr_val == 0:
+            iqr_val = (
+                q75 - q25
+                if not _is_missing_scale_value(q75)
+                and not _is_missing_scale_value(q25)
+                else None
+            )
+            if iqr_val is None or not np.isfinite(float(iqr_val)) or iqr_val == 0:
                 iqr_val = 1.0
-            if med is None:
+            if _is_missing_scale_value(med):
                 med = 0.0
             scaled = scaled.with_columns(
                 ((pl.col(col) - med) / iqr_val).alias(col)
@@ -67,7 +81,9 @@ def impute_per_session(
             med = filled[col].median()
             if med is None:
                 med = 0.0
-            filled = filled.with_columns(pl.col(col).fill_null(med).fill_nan(med).alias(col))
+            filled = filled.with_columns(
+                pl.col(col).fill_null(med).fill_nan(med).alias(col)
+            )
         parts.append(filled)
     return pl.concat(parts) if parts else df
 

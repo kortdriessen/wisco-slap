@@ -15,16 +15,6 @@ import wisco_slap.defs as DEFS
 from wisco_slap.meta.get import sync_info
 
 
-def load_datStartTimes(subject, exp, loc, acq):
-    path = f"{DEFS.data_root}/{subject}/{exp}/{loc}/{acq}/datStartTimes1.txt"
-    if not os.path.exists(path):
-        print("DAT START TIMES FILE NOT FOUND, RUN MATLAB SCRIPT TO GENERATE")
-        raise FileNotFoundError(f"File not found: {path}")
-    with open(path) as f:
-        datStartTimes = [pd.Timestamp(line.strip()) for line in f]
-    return datStartTimes
-
-
 def load_sync_block(
     subject: str, exp: str, sync_block: int
 ) -> tuple[np.ndarray, np.ndarray] | tuple[str, str]:
@@ -128,40 +118,79 @@ def load_all_sync_blocks(subject, exp):
     return scopes, ephyses
 
 
-def compute_ephys_offset(
-    subject, exp, loc, acq, si, scope=None, ephys=None, fs=5000, ephys_start_sample=None
+def match_scope_up_window(
+    scope, ephys, dat_start, ephys_start_ts, fs=5000, ephys_start_sample=None
 ):
-    acq_id = f"{loc}--{acq}"
-    # block = si[subject][exp]["acquisitions"][acq_id]["sync_block"]
-    block = 1
-    if scope is None and ephys is None:
-        scope, ephys = load_sync_block(subject, exp, block)
+    """Pure offset-matcher: given a SYNC file's scope and ephys channels, a
+    microscope acquisition wall-clock start, and the TDT block's wall-clock
+    start, return the best-matching ``ephys_offset`` in seconds.
+
+    Extracted from ``compute_ephys_offset`` so it can be called per-epoch
+    (with a different ``dat_start`` for each epoch) as well as per-acq.
+
+    Parameters
+    ----------
+    scope : np.ndarray
+        The ``slap2_acquiring_trigger`` channel from the SYNC HDF5 file.
+    ephys : np.ndarray
+        The ``electrophysiology`` channel from the SYNC HDF5 file.
+    dat_start : pd.Timestamp
+        Wall-clock start time of the microscope acquisition/epoch.
+    ephys_start_ts : pd.Timestamp
+        Wall-clock start time of the TDT block (from ``sync_info.yaml``
+        ``sync_blocks[<block>].ephys_start``).
+    fs : int, optional
+        SYNC file sampling rate in Hz, by default 5000.
+    ephys_start_sample : int, optional
+        Pre-detected ephys-ON sample index. If None, auto-detected via
+        :func:`detect_ephys_start_sample`.
+
+    Returns
+    -------
+    float
+        ``ephys_offset`` in seconds — i.e. seconds from the TDT block's start
+        to this acquisition/epoch's start.
+    """
     scope_df = spy.utils.drec.generate_scope_index_df(scope)
-    scope_df["sync_block"] = block
     if ephys_start_sample is None:
         ephys_start_sample = detect_ephys_start_sample(ephys)
     scope_df["ephys_up"] = ephys_start_sample
     scope_df["ephys_scope_diff"] = scope_df["start_idx"] - scope_df["ephys_up"]
     scope_df["ephys_scope_diff_s"] = scope_df["ephys_scope_diff"] / fs
-    ephys_start_estimate = pd.Timestamp(
-        si[subject][exp]["sync_blocks"][block]["ephys_start"]
-    )
-    scope_df["ephys_start_estimate"] = ephys_start_estimate
 
-    est_start = pd.Timestamp(si[subject][exp]["acquisitions"][acq_id]["dat_start"])
-
-    est_start_diff = [
-        (scope_df["ephys_start_estimate"][i] - est_start).total_seconds()
-        for i in range(len(scope_df))
-    ]
-    est_start_diff_abs = [np.abs(est_start_diff[i]) for i in range(len(est_start_diff))]
-    est_start_differential = np.abs(scope_df["ephys_scope_diff_s"] - est_start_diff_abs)
+    est_start = pd.Timestamp(dat_start)
+    ephys_start = pd.Timestamp(ephys_start_ts)
+    wall_gap_abs = np.abs((ephys_start - est_start).total_seconds())
+    est_start_differential = np.abs(scope_df["ephys_scope_diff_s"] - wall_gap_abs)
     scope_df["est_start_differential"] = est_start_differential
     print(scope_df["est_start_differential"].min())
     ephys_offset = scope_df.loc[
         scope_df["est_start_differential"].idxmin(), "ephys_scope_diff"
     ]
     return ephys_offset / fs
+
+
+def compute_ephys_offset(
+    subject, exp, loc, acq, si, scope=None, ephys=None, fs=5000, ephys_start_sample=None
+):
+    """Compute ephys_offset for an acq by looking up sync-block + dat_start
+    in sync_info, loading the SYNC file if needed, and running the matcher.
+
+    For multi-epoch acqs this returns epoch 1's offset (since ``dat_start``
+    in sync_info is defined as epoch 1's filename timestamp).
+    """
+    acq_id = f"{loc}--{acq}"
+    block = si[subject][exp]["acquisitions"][acq_id]["sync_block"]
+    if scope is None and ephys is None:
+        scope, ephys = load_sync_block(subject, exp, block)
+    dat_start = pd.Timestamp(si[subject][exp]["acquisitions"][acq_id]["dat_start"])
+    ephys_start_ts = pd.Timestamp(
+        si[subject][exp]["sync_blocks"][block]["ephys_start"]
+    )
+    return match_scope_up_window(
+        scope, ephys, dat_start, ephys_start_ts, fs=fs,
+        ephys_start_sample=ephys_start_sample,
+    )
 
 
 def find_corrupted_sync_offsets(subject, exp, loc, acq, si):
@@ -185,7 +214,7 @@ def find_corrupted_sync_offsets(subject, exp, loc, acq, si):
 
     if len(starts) == 0:
         print(f"No valid start times found for {subject} {exp} {loc} {acq}")
-        return -10
+        return None
 
     # find the start time (and corresponding acq_id) that is closest to the acquisition start time
     closest_start = min(starts, key=lambda x: abs(x - start_time))
@@ -232,23 +261,74 @@ def find_corrupted_sync_offsets(subject, exp, loc, acq, si):
     return diff_in_time
 
 
-def _est_start_time_from_file_name(subject, exp, loc, acq):
+def _list_epoch_start_times(subject, exp, loc, acq):
+    """Return the per-epoch start times parsed from the DMD1 first-cycle
+    .dat filenames in this acq's directory.
+
+    Returns a list of ``(filename, timestamp)`` tuples, sorted ascending by
+    ``timestamp``. Single-epoch acqs produce a list of length 1; multi-epoch
+    acqs (paused and restarted during scanning, typically re-assembled by the
+    preprocessing pipeline's epoch functionality) produce length > 1. Returns
+    an empty list if no matching files are found.
+
+    Sorting is by the parsed timestamp, NOT by filename string — the
+    ``acq-N_`` prefix is not guaranteed to be monotonic with wall clock (and
+    lexicographic sort breaks at ``acq-10`` anyway).
+    """
     acq_dir = f"{DEFS.data_root}/{subject}/{exp}/{loc}/{acq}"
+    if not os.path.isdir(acq_dir):
+        return []
+    found = []
     for f in os.listdir(acq_dir):
         if "_DMD1-CYCLE-000000.dat" in f:
-            est_start_time = pd.to_datetime(
-                f.split("_DMD1-CYCLE-000000.dat")[0][-15:], format="%Y%m%d_%H%M%S"
+            ts_str = f.split("_DMD1-CYCLE-000000.dat")[0][-15:]
+            try:
+                ts = pd.to_datetime(ts_str, format="%Y%m%d_%H%M%S")
+            except ValueError:
+                continue
+            found.append((f, ts))
+    found.sort(key=lambda x: x[1])
+    return found
+
+
+def _est_start_time_from_file_name(subject, exp, loc, acq, verbose=True):
+    """Parse the acquisition-start wall-clock time from the DMD1 first-cycle
+    .dat filename.
+
+    The SLAP2 acquisition software stamps the wall-clock start time into every
+    raw .dat filename as ``_YYYYMMDD_HHMMSS_`` (1-second resolution). This is
+    precise enough to anchor scope-up-window matching in the SYNC file,
+    avoiding the need for a MATLAB-generated ``datStartTimes1.txt`` file.
+
+    For multi-epoch acqs (multiple first-cycle .dat files, one per epoch),
+    returns the earliest timestamp — i.e. epoch 1.
+    """
+    epochs = _list_epoch_start_times(subject, exp, loc, acq)
+    if not epochs:
+        if verbose:
+            acq_dir = f"{DEFS.data_root}/{subject}/{exp}/{loc}/{acq}"
+            print(
+                f"No file with _DMD1-CYCLE-000000.dat found in {acq_dir}, "
+                f"returning None for estimated start time"
             )
-            return est_start_time
-    print(
-        f"No file with _DMD1-CYCLE-000000.dat found in {acq_dir}, returning None for estimated start time"
-    )
-    return None
+        return None
+    return epochs[0][1]
 
 
-def _is_datStart_present(subject, exp, loc, acq):
-    path = f"{DEFS.data_root}/{subject}/{exp}/{loc}/{acq}/datStartTimes1.txt"
-    return os.path.exists(path)
+def _has_first_cycle_dat_file(subject, exp, loc, acq):
+    """Return True if at least one DMD1 first-cycle .dat file exists for
+    this acq.
+
+    Used as the precondition check for sync-info population, replacing the
+    previous ``datStartTimes1.txt`` existence check.
+    """
+    acq_dir = f"{DEFS.data_root}/{subject}/{exp}/{loc}/{acq}"
+    if not os.path.isdir(acq_dir):
+        return False
+    for f in os.listdir(acq_dir):
+        if "_DMD1-CYCLE-000000.dat" in f:
+            return True
+    return False
 
 
 def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
@@ -280,13 +360,42 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
     for acq_id in acqs_all:
         if acq_id not in si[subject][exp]["acquisitions"].keys():
             loc, acq = acq_id.split("--")
-            if _is_datStart_present(subject, exp, loc, acq):
+            if _has_first_cycle_dat_file(subject, exp, loc, acq):
                 acqs.append(acq_id)
 
+    # Fast backfill of cheap-to-compute fields on existing entries. Only add
+    # fields here that are (a) cheap — no SYNC loads / hysteresis / offset
+    # math — and (b) a pure function of current raw-data state. For anything
+    # expensive, or anything that re-touches the ephys_offset matcher, use
+    # redo=True. Skips any entry whose raw files have disappeared (leaves
+    # n_epochs absent rather than writing the non-sensical value 0, since an
+    # acq by definition has >= 1 epoch).
+    backfilled = False
+    for acq_id, entry in si[subject][exp].get("acquisitions", {}).items():
+        if acq_id in acqs:
+            continue  # about to be freshly populated below
+        loc, acq = acq_id.split("--")
+        if "n_epochs" not in entry and _has_first_cycle_dat_file(
+            subject, exp, loc, acq
+        ):
+            entry["n_epochs"] = len(
+                _list_epoch_start_times(subject, exp, loc, acq)
+            )
+            backfilled = True
+
     if len(acqs) == 0 and not redo:
-        print(
-            f"All acquisitions already have sync info for {subject} {exp}. Use redo=True to update."
-        )
+        if backfilled:
+            with open(f"{DEFS.anmat_root}/sync_info.yaml", "w") as f:
+                yaml.dump(si, f)
+            print(
+                f"Backfilled missing cheap fields for {subject} {exp} "
+                f"(no new acqs to fully process)."
+            )
+        else:
+            print(
+                f"All acquisitions already have sync info for {subject} {exp}. "
+                f"Use redo=True to recompute."
+            )
         return
 
     sb, sp = get_all_sync_paths(subject, exp)
@@ -314,11 +423,17 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
 
     for acq_id in acqs:
         loc, acq = acq_id.split("--")
-        dat_starts = load_datStartTimes(subject, exp, loc, acq)
-        dat_start = pd.Timestamp(dat_starts[0])
+        epochs = _list_epoch_start_times(subject, exp, loc, acq)
+        assert epochs, (
+            f"No DMD1 first-cycle .dat file found for {subject}/{exp}/{loc}/{acq} "
+            f"despite _has_first_cycle_dat_file passing — race condition?"
+        )
+        dat_start = epochs[0][1]  # earliest epoch (epoch 1)
+        n_epochs = len(epochs)
         si[subject][exp]["acquisitions"][acq_id] = {}
         si[subject][exp]["acquisitions"][acq_id]["sync_block"] = assignments[acq_id]
         si[subject][exp]["acquisitions"][acq_id]["dat_start"] = str(dat_start)
+        si[subject][exp]["acquisitions"][acq_id]["n_epochs"] = n_epochs
         if ephys_start_sample is not None and acq_id in ephys_start_sample.keys():
             start_sample_to_use = ephys_start_sample[acq_id]
         else:
@@ -337,16 +452,20 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
             offset = float(offset)
         else:
             offset = find_corrupted_sync_offsets(subject, exp, loc, acq, si)
-            offset = float(offset)
+            offset = float(offset) if offset is not None else None
         si[subject][exp]["acquisitions"][acq_id]["ephys_offset"] = offset
 
-    # One final check for any acquisitions left with an offset of -10, indicating they may have needed a subsequent acquisition which was not corrupted.
+    # One final retry for any acquisitions still unresolved (offset is None),
+    # which can happen when a corrupt acq was processed before any non-corrupt
+    # reference was populated. By this pass, references are in place, so the
+    # lookup usually succeeds. Anything still None after this means no
+    # non-corrupt sync block exists anywhere in the experiment to anchor against.
     for acq_id in si[subject][exp]["acquisitions"].keys():
         loc, acq = acq_id.split("--")
-        if si[subject][exp]["acquisitions"][acq_id]["ephys_offset"] == -10:
+        if si[subject][exp]["acquisitions"][acq_id]["ephys_offset"] is None:
             ephys_offset = find_corrupted_sync_offsets(subject, exp, loc, acq, si)
-            si[subject][exp]["acquisitions"][acq_id]["ephys_offset"] = float(
-                ephys_offset
+            si[subject][exp]["acquisitions"][acq_id]["ephys_offset"] = (
+                float(ephys_offset) if ephys_offset is not None else None
             )
 
     # write the updated sync info to the yaml file
