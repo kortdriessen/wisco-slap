@@ -345,3 +345,149 @@ def rolling_mad(
         mad = mad * 1.4826
 
     return xr.DataArray(mad, dims=da.dims, coords=da.coords, name="mad")
+
+
+def rolling_std(
+    da: xr.DataArray,
+    window: int,
+    dim: str = "time",
+    center: bool = True,
+    ddof: int = 0,
+    min_count: int | None = None,
+    post_smoothing: bool = False,
+    smoothing_window: int | None = None,
+    smoothing_method: Literal["median", "mean"] = "median",
+) -> xr.DataArray:
+    """Centered rolling standard deviation via bottleneck.move_std.
+
+    The std analogue of :func:`rolling_mad`: same windowing, centering and
+    NaN handling, but a single pass since move_std needs no median subtraction.
+
+    NaN-tolerant: NaNs in `da` are ignored within each window. Output is
+    NaN only where fewer than `min_count` real samples sit in the window
+    (i.e. the center of a gap longer than ~window samples). Defaults to
+    `max(1, window // 4)` — at least 25% of the window must be real.
+
+    Parameters
+    ----------
+    ddof : int
+        Delta degrees of freedom passed to ``bottleneck.move_std``. 0 (default)
+        gives the population std; 1 gives the sample (Bessel-corrected) std.
+        This replaces `rolling_mad`'s MAD-specific `scale` argument.
+    post_smoothing : bool
+        If True, run a second moving pass over the std estimate itself to
+        produce a cleaner noise-floor curve. Off by default (the raw rolling
+        std is returned unchanged).
+    smoothing_window : int | None
+        Width, in samples, of the post-smoothing pass. ``None`` (default)
+        resolves to ``3 * window``. The reason it is a *multiple* of ``window``
+        and not equal to it: a brief event inflates the std for ~``window``
+        samples (as long as it sits anywhere inside the sliding window), so the
+        bump in the std series has width ~``window``. A moving median of width
+        ``w`` only rejects a positive bump of width ``b`` when ``w > 2 * b``;
+        ``3 * window`` clears that with margin (empirically the std snaps back to
+        the true floor at ~3x and barely moves at 1x). Widen further for more
+        aggressive rejection, narrow toward ``window`` to merely de-jitter.
+    smoothing_method : {"median", "mean"}
+        How to post-smooth. ``"median"`` (default) is the right choice for a
+        noise *floor*: a moving median *rejects* the event-induced bump
+        outright, so the curve tracks baseline noise rather than activity.
+        ``"mean"`` is a plain box smoother — it can only dilute a bump, never
+        remove it, so transients always leak into the floor; use it only to
+        de-jitter an already event-free estimate. Both are NaN-tolerant
+        (bottleneck ``move_*`` with the module's ``max(1, smoothing_window // 4)``
+        min-count rule), so short gaps in the std series are bridged while long
+        gaps stay NaN.
+
+    Notes
+    -----
+    Post-smoothing is intentionally distinct from simply widening ``window``.
+    A larger ``window`` averages *squared deviations*, so a single event raises
+    the estimate proportionally and lingers; a moving median over the std
+    series *discards* those excursions. Reach for ``post_smoothing`` when you
+    want the noise floor to ignore activity, not just a wider average.
+    """
+    axis = da.get_axis_num(dim)
+    arr = np.ascontiguousarray(da.values)
+    if min_count is None:
+        min_count = max(1, window // 4)
+
+    if center:
+        pad_left = window // 2
+        pad_right = window - 1 - pad_left
+        pads = [(0, 0)] * arr.ndim
+        pads[axis] = (pad_left, pad_right)
+        # Pad with NaN, not 'edge' (see rolling_mad): with min_count < window
+        # the NaN padding is simply ignored inside each window, whereas 'edge'
+        # would smear leading/trailing NaNs across the padding.
+        padded = np.pad(arr, pads, mode="constant", constant_values=np.nan)
+        sl = [slice(None)] * arr.ndim
+        sl[axis] = slice(window - 1, None)
+        sl = tuple(sl)
+
+        std = bn.move_std(
+            padded, window=window, min_count=min_count, axis=axis, ddof=ddof
+        )[sl]
+    else:
+        std = bn.move_std(
+            arr, window=window, min_count=min_count, axis=axis, ddof=ddof
+        )
+
+    out = xr.DataArray(std, dims=da.dims, coords=da.coords, name="std")
+
+    if post_smoothing:
+        out = _smooth_estimate(
+            out,
+            window=3 * window if smoothing_window is None else smoothing_window,
+            dim=dim,
+            method=smoothing_method,
+            center=center,
+        )
+
+    return out
+
+
+def _smooth_estimate(
+    da: xr.DataArray,
+    *,
+    window: int,
+    dim: str,
+    method: Literal["median", "mean"],
+    center: bool,
+) -> xr.DataArray:
+    """Post-smooth a rolling-statistic series with a NaN-tolerant moving pass.
+
+    Reuses the centered NaN-padding trick from :func:`rolling_std` so the
+    smoother is centered and edge-safe, and ignores NaN gaps inside each
+    window. ``min_count`` follows the module convention of
+    ``max(1, window // 4)``: short gaps in the input series are bridged, long
+    gaps stay NaN.
+    """
+    if window < 2:
+        return da
+
+    move_fn = {"median": bn.move_median, "mean": bn.move_mean}.get(method)
+    if move_fn is None:
+        raise ValueError(
+            f"smoothing_method must be 'median' or 'mean', got {method!r}."
+        )
+
+    axis = da.get_axis_num(dim)
+    arr = np.ascontiguousarray(da.values)
+    min_count = max(1, window // 4)
+
+    if center:
+        pad_left = window // 2
+        pad_right = window - 1 - pad_left
+        pads = [(0, 0)] * arr.ndim
+        pads[axis] = (pad_left, pad_right)
+        padded = np.pad(arr, pads, mode="constant", constant_values=np.nan)
+        sl = [slice(None)] * arr.ndim
+        sl[axis] = slice(window - 1, None)
+        smoothed = move_fn(padded, window=window, min_count=min_count, axis=axis)[
+            tuple(sl)
+        ]
+    else:
+        smoothed = move_fn(arr, window=window, min_count=min_count, axis=axis)
+
+    return xr.DataArray(smoothed, dims=da.dims, coords=da.coords, name=da.name)

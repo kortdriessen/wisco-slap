@@ -82,6 +82,7 @@ def plot_slap2_corr_matrix(
     group_by_soma: bool = False,
     soma_color: str | None = None,
     dend_type_colors: Mapping[str, str] | None = None,
+    naked_matrix: bool = False,
 ):
     """Plot a synapse-by-synapse correlation matrix.
 
@@ -120,7 +121,15 @@ def plot_slap2_corr_matrix(
         → `{"Apical"/"apical": orange, "Basal"/"basal": blue}` when
         `group_by_soma`, otherwise empty (all middle-level brackets use
         `bracket_color`).
+    naked_matrix : bool
+        If True, plot only the matrix and the internal dendrite-division
+        lines — no colour bar, no brackets, no labels, no axis decorations.
+        Overrides `cbar_label`, `show_x_brackets`, and `show_y_brackets`.
     """
+    if naked_matrix:
+        cbar_label = None
+        show_x_brackets = False
+        show_y_brackets = False
     if "syn_1" not in corr.dims or "syn_2" not in corr.dims:
         raise ValueError("`corr` must have dims ('syn_1', 'syn_2').")
     n = corr.sizes["syn_1"]

@@ -10,6 +10,8 @@ data_root: str = (
 ssh_data_root = "slapmi@tononi-nas:/mnt/pool1/tononi_volume10/slap_mi/data"
 # root of the analysis directory, local
 anmat_root: str = "/data/slap_analysis/analysis_materials"
+# local mirror of raw acquisition data (registered/downsampled TIFFs, .dat, etc.)
+raw_mirror_root: str = "/data/raw_mirror"
 # -------------------------------------------------------------
 
 annotation_root = os.path.join(anmat_root, "annotation_materials")

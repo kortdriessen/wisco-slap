@@ -123,6 +123,115 @@ def _make_exp_kernel(tau_frames: float, n_tau: float = 8.0) -> np.ndarray:
     return kernel
 
 
+def _matched_filter_kernel(
+    tau_decay_frames: float,
+    tau_rise_frames: float | None = None,
+    n_tau: float = 5.0,
+) -> np.ndarray:
+    """Unit-energy matched-filter template (the expected single-event shape).
+
+    The template models one fluorescence transient, sampled in frames, and is
+    normalised so that ``sum(kernel**2) == 1`` (unit L2 norm). With this
+    normalisation the matched-filter output has the same noise std as the
+    input, and a clean event of amplitude ``A`` and energy ``E`` produces an
+    output peak of ``A * sqrt(E)`` — the canonical convention that makes the
+    output directly comparable to a rolling noise estimate.
+
+    Index 0 is the event onset. For ``tau_rise_frames is None`` (the default)
+    the template is a pure exponential decay with an instantaneous rise, so
+    onset == fluorescence peak — the standard iGluSnFR approximation. When a
+    rise constant is given, the template is a difference of exponentials
+    ``exp(-t/tau_decay) - exp(-t/tau_rise)`` (a finite-rise transient), whose
+    output peak then lands at the event *onset*, slightly before the
+    fluorescence peak.
+
+    Parameters
+    ----------
+    tau_decay_frames : float
+        Indicator decay time constant, in frames (``tau_decay_s * fs``).
+    tau_rise_frames : float or None
+        Rise time constant in frames. ``None`` => instantaneous rise.
+    n_tau : float
+        Template length in units of ``tau_decay_frames`` (default 5, capturing
+        >99% of the decay energy). The exponential tail beyond this only adds
+        noise to the matched-filter output.
+
+    Returns
+    -------
+    np.ndarray, shape ``(kernel_len,)``
+        Unit-energy template with the event onset at index 0.
+    """
+    if tau_decay_frames <= 0:
+        raise ValueError(f"tau_decay_frames must be > 0; got {tau_decay_frames}")
+
+    length = max(2, int(np.ceil(n_tau * tau_decay_frames)))
+    t = np.arange(length, dtype=np.float64)
+
+    if tau_rise_frames is None:
+        kernel = np.exp(-t / tau_decay_frames)
+    else:
+        if tau_rise_frames <= 0:
+            raise ValueError(f"tau_rise_frames must be > 0; got {tau_rise_frames}")
+        kernel = np.exp(-t / tau_decay_frames) - np.exp(-t / tau_rise_frames)
+        kernel = np.maximum(kernel, 0.0)
+
+    norm = np.linalg.norm(kernel)
+    if norm == 0.0:
+        raise ValueError("Degenerate matched-filter kernel (zero L2 norm).")
+    return kernel / norm
+
+
+def _matched_filter_correlate(
+    data: np.ndarray, kernel: np.ndarray, min_valid_frac: float
+) -> np.ndarray:
+    """Onset-aligned, NaN-safe matched-filter correlation along the last axis.
+
+    Computes the cross-correlation ``y[..., n] = sum_k data[..., n+k] *
+    kernel[k]``, so a unit event whose onset is at sample ``n0`` produces an
+    output peak at ``n0`` (no ``mode='same'`` centering shift). NaN gaps are
+    zero-filled for the correlation; an output sample is set to NaN when less
+    than ``min_valid_frac`` of the *kernel energy* falls on valid (finite)
+    input samples.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Trace array; correlation runs along the last axis.
+    kernel : np.ndarray, shape ``(kernel_len,)``
+        Unit-energy matched-filter template (onset at index 0).
+    min_valid_frac : float
+        Minimum fraction (0-1) of kernel energy that must land on valid
+        samples for the output to be kept; below this the output is NaN.
+
+    Returns
+    -------
+    np.ndarray
+        Matched-filter output, same shape as ``data``.
+    """
+    klen = kernel.size
+    orig_shape = data.shape
+    flat = data.reshape(-1, orig_shape[-1]).astype(np.float64)
+    n_time = flat.shape[-1]
+
+    valid = np.isfinite(flat)
+    filled = np.where(valid, flat, 0.0)
+
+    # Cross-correlation via full convolution with the reversed kernel:
+    #   fftconvolve(x, kernel[::-1], 'full')[n + klen - 1] == sum_k x[n+k] kernel[k]
+    rev = kernel[::-1][np.newaxis, :]
+    full = fftconvolve(filled, rev, mode="full", axes=-1)
+    corr = full[:, klen - 1 : klen - 1 + n_time].copy()
+
+    if not valid.all():
+        # Fraction of kernel energy (sum kernel**2 == 1) landing on valid samples.
+        energy_rev = (kernel**2)[::-1][np.newaxis, :]
+        full_e = fftconvolve(valid.astype(np.float64), energy_rev, mode="full", axes=-1)
+        valid_energy = full_e[:, klen - 1 : klen - 1 + n_time]
+        corr[valid_energy < min_valid_frac] = np.nan
+
+    return corr.reshape(orig_shape)
+
+
 def _conv1d_last(data: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     """Convolve *data* with a 1-D *kernel* along the last axis (mode='same')."""
     shape = [1] * (data.ndim - 1) + [len(kernel)]
@@ -301,7 +410,9 @@ def _safe_f0_for_division(f0: np.ndarray) -> np.ndarray:
     if finite.size == 0:
         return safe
 
-    floor = max(_ROI_DFF_DIV_ABS_EPS, float(np.nanmedian(finite)) * _ROI_DFF_DIV_REL_EPS)
+    floor = max(
+        _ROI_DFF_DIV_ABS_EPS, float(np.nanmedian(finite)) * _ROI_DFF_DIV_REL_EPS
+    )
     small = np.abs(safe) < floor
     safe[small] = np.where(safe[small] < 0, -floor, floor)
     return safe
@@ -335,7 +446,17 @@ def ls_to_matchFilt(
     ls_scopex_dataarray: xr.DataArray,
     tau_s: float = IGLUSNFR_TAU_S,
 ) -> xr.DataArray:
-    """Convert an LS trace to a matched-filter trace.
+    """Convert an LS trace to the legacy NoLoCo ``matchFilt`` trace.
+
+    .. note::
+        For new work prefer :func:`ls_to_matched_filter`, which is the
+        canonical, unit-energy, onset-aligned matched filter. This function
+        reproduces the *old NoLoCo pipeline* output and is kept only for
+        backward comparison. It is, in effect, an **unnormalised, untruncated**
+        matched filter: the backward EMA equals ``(1 - gamma)`` times the
+        cross-correlation of the trace with an infinite exponential-decay
+        template, so its peak SNR is near-optimal but its output scale is
+        arbitrary and it integrates noise from the full (infinite) future tail.
 
     Recreates the ``matchFilt`` trace from the old NoLoCo pipeline by
     applying a backward exponential filter matched to the indicator decay
@@ -371,6 +492,97 @@ def ls_to_matchFilt(
         dims=ls_scopex_dataarray.dims,
         coords=ls_scopex_dataarray.coords,
         attrs={**ls_scopex_dataarray.attrs, "trace_type": "matchFilt", "tau_s": tau_s},
+    )
+
+
+def ls_to_matched_filter(
+    ls_scopex_dataarray: xr.DataArray,
+    tau_s: float = IGLUSNFR_TAU_S,
+    tau_rise_s: float | None = None,
+    n_tau: float = 5.0,
+    min_valid_frac: float = 0.5,
+) -> xr.DataArray:
+    """Optimal matched filter of an LS trace (canonical, onset-aligned).
+
+    This is the textbook matched filter and the recommended base for event
+    detection, visualisation, and any SNR-sensitive analysis. It cross-
+    correlates the trace with the **unit-energy** expected event template
+    (:func:`_matched_filter_kernel`). For additive white noise this is the
+    linear filter that maximises the output peak SNR.
+
+    Properties of the output (these are what make it "canonical"):
+
+    - **Onset-aligned.** A clean event whose onset is at time ``t0`` produces
+      an output peak at ``t0`` — there is no centering shift. For an
+      instantaneous-rise indicator (iGluSnFR) onset == fluorescence peak, so
+      the matched-filter peak lands on the LS peak. (Contrast
+      :func:`ls_to_matchFilt` and the old event-detection pipeline, whose
+      ``mode='same'`` correlation pushed peaks forward by half the kernel.)
+    - **Unit-energy normalisation.** The template has ``||s||_2 == 1``, so the
+      output noise std equals the input noise std and a clean event of
+      amplitude ``A`` (energy ``E``) peaks at ``A * sqrt(E)``. SNR is then
+      simply ``output / rolling_noise_std(output)`` — computed downstream, not
+      here, to keep this a clean linear base.
+    - **Finite (~``n_tau`` * tau) template**, capturing essentially all of the
+      decay energy without integrating extra noise from the tail.
+    - **NaN-safe.** Gaps are zero-filled for the correlation and the output is
+      NaN wherever less than ``min_valid_frac`` of the kernel energy lands on
+      valid samples.
+
+    Optimality caveats (the matched filter is optimal *given* these): it
+    assumes the template matches the true event shape (swap ``tau_s`` /
+    ``tau_rise_s`` or pass a measured kernel to refine it) and that the noise
+    is white. SLAP2 shot noise is approximately white but signal-dependent;
+    inverse-noise (whitening) weighting is a possible future refinement, not
+    part of this canonical base.
+
+    Parameters
+    ----------
+    ls_scopex_dataarray : xr.DataArray
+        LS scopex DataArray (typically dims ``["channel", "syn_id", "time"]``).
+        The matched filter is applied along ``time``.
+    tau_s : float
+        Indicator decay time constant in seconds. Default ``IGLUSNFR_TAU_S``
+        (0.026 s). Use ~0.15 for jRGECO1a calcium.
+    tau_rise_s : float or None
+        Optional rise time constant in seconds. ``None`` (default) gives a
+        pure exponential-decay template (instantaneous rise; onset == peak).
+        When set, a difference-of-exponentials template models a finite rise
+        and the output peaks at the event onset.
+    n_tau : float
+        Template length in units of ``tau_s`` (default 5).
+    min_valid_frac : float
+        Minimum fraction (0-1) of kernel energy that must fall on valid (non-
+        NaN) samples for an output sample to be kept. Default 0.5.
+
+    Returns
+    -------
+    xr.DataArray
+        Matched-filtered trace with the same shape, dims, and coords, and
+        ``trace_type="matched_filter"`` in ``attrs``.
+    """
+    fs = _get_fs(ls_scopex_dataarray)
+    tau_decay_frames = tau_s * fs
+    tau_rise_frames = tau_rise_s * fs if tau_rise_s is not None else None
+
+    kernel = _matched_filter_kernel(
+        tau_decay_frames, tau_rise_frames=tau_rise_frames, n_tau=n_tau
+    )
+    filtered = _matched_filter_correlate(
+        ls_scopex_dataarray.values, kernel, min_valid_frac
+    )
+
+    return xr.DataArray(
+        filtered.astype(np.float32),
+        dims=ls_scopex_dataarray.dims,
+        coords=ls_scopex_dataarray.coords,
+        attrs={
+            **ls_scopex_dataarray.attrs,
+            "trace_type": "matched_filter",
+            "tau_s": tau_s,
+            "tau_rise_s": "none" if tau_rise_s is None else tau_rise_s,
+            "mf_kernel_len": int(kernel.size),
+        },
     )
 
 

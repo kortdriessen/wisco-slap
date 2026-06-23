@@ -6,6 +6,10 @@ from . import peri as peri
 from . import pns as pns
 from . import scope as scope
 from . import util as util
+from . import viz as viz
 from .util import validity as validity  # surfaced at top level for convenience
 
-__all__ = ["core", "defs", "get", "peri", "util", "scope", "pns", "meta", "validity"]
+__all__ = [
+    "core", "defs", "get", "peri", "util", "scope", "pns", "meta", "validity",
+    "viz",
+]

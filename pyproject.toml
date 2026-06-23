@@ -25,14 +25,16 @@ dependencies = [
     "streamlit>=1.50.0",
     "lightgbm>=4.6.0",
     "statsmodels>=0.14.6",
+    "bottleneck>=1.6.0",
 ]
 
 # Dev-only deps: tools + notebooks.
 # uv supports groups; install with: uv sync --group dev
 [dependency-groups]
 dev = [
+    "pytest>=9.0",
     "ruff>=0.13.0",
-    "ty>=0.0.8",
+    "ty>=0.0.47",
 ]
 
 [build-system]
@@ -72,7 +74,7 @@ select = ["E", "F", "I", "B", "UP"]
 # You can add more later (e.g. "N", "SIM", "C4", "RUF", etc.)
 
 [tool.ruff.lint.isort]
-known-first-party = ["wisco_slap"]
+known-first-party = ["wisco_slap", "slap2_py", "electro_py", "loupe", "wisynaptic", "kplot"]
 
 [tool.ruff.format]
 # Ruff formatter is the Black replacement (no Black config needed).
@@ -88,9 +90,6 @@ line-ending = "auto"
 
 [tool.ty.environment]
 python-version = "3.12"
-
-[tool.ty.src]
-# Optional: helpful to be explicit in src-layout repos.
 root = ["./src"]
 
 # Example: ignore (or warn/error) specific rules if needed:
