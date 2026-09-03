@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
 STATE_NAMES: list[str] = ["NREM", "REM", "Wake"]
 STATE_TO_IDX: dict[str, int] = {s: i for i, s in enumerate(STATE_NAMES)}
 N_STATES: int = len(STATE_NAMES)

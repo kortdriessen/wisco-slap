@@ -25,20 +25,13 @@ A typical time-evolution workflow:
 from __future__ import annotations
 
 import warnings
-from typing import Iterable
+from collections.abc import Iterable
 
 import numpy as np
 import polars as pl
-import xarray as xr
 
 from ... import get as _get
 from ...util.validity.mask import validity_mask
-from .aggregate import (
-    aggregate_fisher_z,
-    aggregate_pooled_sums,
-    aggregate_simple_mean,
-)
-from .bouts import all_segments_in_state, fixed_valid_bouts, random_subsample_bouts
 from .state_compare import (
     _AGGREGATORS,
     _BOUT_BUILDERS,

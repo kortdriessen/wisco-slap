@@ -1,15 +1,15 @@
 import os
 
-import electro_py as epy
+import fluxplot.colors as fpc
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-import slap2_py as spy
 import tifffile as tiff
-from kplot.colors import flex
 from matplotlib.path import Path
 from PIL import Image
 
+import electro_py as epy
+import slap2_py as spy
 import wisco_slap as wis
 from wisco_slap.defs import annotation_root, data_root
 
@@ -473,149 +473,3 @@ def save_roi_location_tiffs(
             photometric=photometric,
             metadata=({"axes": axes} if axes else None),
         )
-
-
-# write nan-value plots
-# give a scopex array, give me a basic plot where each row is a synapse; x axis is time, the color indicates whether the value is nan or not.
-# flex.green300 for not nan, flex.magenta400 for nan. Blank if there is simply a gap.
-def plot_nan_values(sx_array, ax=None, gap_factor=1.5):
-    """Plot the NaN structure of a scopex array.
-
-    Each row is one synapse, x is time. Green where the value is finite,
-    magenta where the value is NaN, blank where the time axis itself has a gap
-    (consecutive samples spaced > `gap_factor` x the median sampling interval).
-
-    Parameters
-    ----------
-    sx_array : xr.DataArray
-        Scopex DataArray with `time` and `syn_id` dims. If a `channel` dim of
-        size 1 is present it is squeezed; >1 errors.
-    ax : matplotlib.axes.Axes, optional
-    gap_factor : float
-        Intervals between consecutive original time samples larger than
-        `gap_factor * median(dt)` are rendered as transparent gap cells.
-
-    Returns
-    -------
-    matplotlib.axes.Axes
-    """
-    from matplotlib.colors import ListedColormap
-
-    da = sx_array
-    if "channel" in da.dims:
-        if da.sizes["channel"] == 1:
-            da = da.squeeze("channel", drop=True)
-        else:
-            raise ValueError(
-                f"`sx_array` has {da.sizes['channel']} channels — select one first."
-            )
-    if "time" not in da.dims or "syn_id" not in da.dims:
-        raise ValueError("`sx_array` must have `time` and `syn_id` dims.")
-    da = da.transpose("syn_id", "time")
-
-    time = np.asarray(da["time"].values, dtype=float)
-    if time.size < 2:
-        raise ValueError("Need at least 2 timepoints to plot.")
-    dts = np.diff(time)
-    dt = float(np.median(dts))
-    if not np.isfinite(dt) or dt <= 0:
-        raise ValueError("Could not determine a positive median sampling interval.")
-
-    # Uniform grid spanning the full time range; original samples drop into
-    # their nearest cell, every other cell stays NaN (= rendered transparent).
-    n_grid = int(np.round((time[-1] - time[0]) / dt)) + 1
-    grid_idx = np.clip(np.round((time - time[0]) / dt).astype(int), 0, n_grid - 1)
-
-    is_nan = np.isnan(da.values)  # (n_syn, n_time)
-    n_syn = is_nan.shape[0]
-
-    # 0 = valid (green), 1 = nan (magenta), NaN = gap (transparent)
-    img = np.full((n_syn, n_grid), np.nan, dtype=float)
-    img[:, grid_idx] = is_nan.astype(float)
-
-    # Force-blank cells that fall inside a "real" time gap (>gap_factor*dt
-    # between consecutive original samples), so a single straggling sample at
-    # the end of a gap doesn't paint a long magenta/green stripe.
-    gap_starts = np.where(dts > gap_factor * dt)[0]
-    for k in gap_starts:
-        a = grid_idx[k] + 1
-        b = grid_idx[k + 1]
-        if b > a:
-            img[:, a:b] = np.nan
-
-    cmap = ListedColormap([flex.green500, flex.blue600])
-    cmap.set_bad("none")
-
-    if ax is None:
-        _, ax = plt.subplots(figsize=(14, max(2.0, 0.18 * n_syn)))
-
-    ax.imshow(
-        img,
-        aspect="auto",
-        interpolation="none",
-        cmap=cmap,
-        vmin=0,
-        vmax=1,
-        origin="lower",
-        extent=(time[0] - dt / 2, time[0] + (n_grid - 0.5) * dt, -0.5, n_syn - 0.5),
-    )
-    ax.set_xlabel("time (s)")
-    ax.set_ylabel("synapse")
-    ax.set_yticks(np.arange(n_syn))
-    ax.set_yticklabels([str(s) for s in np.asarray(da["syn_id"].values)], fontsize=6)
-    valid_frac = float(np.mean(~is_nan))
-    ax.set_title(
-        f"NaN map — {n_syn} syns, {time.size} samples, valid frac: {valid_frac:.3f}"
-    )
-    return ax
-
-
-def exp_nan_plot(subject, exp, loc, acq, save=True, array=None):
-    if array is None:
-        denoised = wis.get.syn_dF(
-            subject, exp, loc, acq, trace="denoised", channels=[0]
-        )
-        dn = wis.get.combine_scopex_arrays(denoised)
-    else:
-        dn = array
-    hypno = wis.get.bout_hypno(subject, exp, loc, acq)
-    hacq = hypno.trim(dn.time.values[0], dn.time.values[-1])
-    f, ax = plt.subplots(
-        2,
-        1,
-        figsize=(28, 15),
-        gridspec_kw={"height_ratios": [1, 6]},
-        layout="constrained",
-    )
-    plot_nan_values(dn, ax=ax[1])
-    state_colors = {}
-    state_colors["NREM"] = (2, flex.blue600)
-    state_colors["REM"] = (3, flex.magenta600)
-    state_colors["Wake"] = (1, flex.green600)
-    f, ax[0] = epy.plot.hypno.plot_basic_hypnogram(
-        hacq,
-        f,
-        ax[0],
-        xlim=(dn.time.values[0], dn.time.values[-1]),
-        style_path=None,
-        single_tone=False,
-        state_colors=state_colors,
-    )
-    total_duration = dn.time.values[-1] - dn.time.values[0]
-    nrem_duration = hacq.df.filter(pl.col("state") == "NREM")["duration"].sum()
-    wake_duration = hacq.df.filter(pl.col("state") == "Wake")["duration"].sum()
-    rem_duration = hacq.df.filter(pl.col("state") == "REM")["duration"].sum()
-    f.suptitle(
-        f"{subject}, {exp}, {loc}, {acq} | Total Duration = {float(total_duration):.1f} s | "
-        f"NREM: {float(nrem_duration):.1f} s | Wake: {float(wake_duration):.1f} s | REM: {float(rem_duration):.1f} s",
-        fontsize=18,
-    )
-    if save:
-        supplementary_plots_dir = os.path.join(
-            wis.defs.annotation_root, subject, exp, loc, acq, "supplementary_plots"
-        )
-        if not os.path.exists(supplementary_plots_dir):
-            os.makedirs(supplementary_plots_dir, exist_ok=True)
-        path = os.path.join(supplementary_plots_dir, "Hypno_NaNs.png")
-        f.savefig(path, dpi=300)
-    return f, ax

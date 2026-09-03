@@ -14,43 +14,88 @@ from __future__ import annotations
 import os
 import sys
 import traceback
-from dataclasses import asdict, replace
-from pathlib import Path
-from typing import Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
-import slap2_py as spy
 from matplotlib.colors import LogNorm
-
 from PySide6.QtCore import (
-    QObject, QPointF, QRectF, QSize, QThread, Qt, Signal,
+    QObject,
+    QPointF,
+    QRectF,
+    Qt,
+    QThread,
+    Signal,
 )
 from PySide6.QtGui import (
-    QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QLinearGradient,
-    QPainter, QPainterPath, QPen, QPixmap,
+    QAction,
+    QBrush,
+    QColor,
+    QImage,
+    QKeySequence,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsItem,
-    QGraphicsItemGroup, QGraphicsPathItem, QGraphicsPixmapItem,
-    QGraphicsRectItem, QGraphicsScene, QGraphicsView, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QScrollArea, QSpinBox, QStatusBar, QVBoxLayout, QWidget,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDockWidget,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGraphicsItem,
+    QGraphicsItemGroup,
+    QGraphicsPathItem,
+    QGraphicsPixmapItem,
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QGraphicsView,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
 )
 
+import slap2_py as spy
 from wisco_slap.meta.get import esum_mirror_path
 from wisco_slap.viz.synapto_overlays import _crop_bbox
 
 from .config import (
-    DMD_KEYS, AcquisitionConfig, CanvasConfig, OverlayKwargs, Placement,
-    ReferenceImage, SceneConfig, TargetStrip,
-    load as load_config, save as save_config,
+    DMD_KEYS,
+    OverlayKwargs,
+    Placement,
+    ReferenceImage,
+    SceneConfig,
+    TargetStrip,
+)
+from .config import (
+    load as load_config,
+)
+from .config import (
+    save as save_config,
 )
 from .render import (
-    LandingInfo, _dend_blocks, _strip_param, landing_info_for_dmd, render_scene,
+    LandingInfo,
+    _dend_blocks,
+    _strip_param,
+    landing_info_for_dmd,
+    render_scene,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -179,7 +224,7 @@ class _ResizeHandle(QGraphicsRectItem):
 
     SIZE = 10  # px on screen
 
-    def __init__(self, parent: "TargetStripItem", corner: str) -> None:
+    def __init__(self, parent: TargetStripItem, corner: str) -> None:
         s = _ResizeHandle.SIZE
         super().__init__(-s / 2, -s / 2, s, s, parent)
         self._corner = corner  # 'tl' | 'tr' | 'bl' | 'br'

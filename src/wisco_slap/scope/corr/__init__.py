@@ -11,18 +11,24 @@ New: a long-form, sleep-state-aware pipeline. The typical entry points are
 :func:`build_state_corr_table_multi` (many somas), then
 :func:`stratified_summaries` and :func:`mixed_state_test` for inference.
 
+Duration-matched synapse-by-synapse matrices per sleep state (the
+correlation-overview figure) live in :mod:`state_matrices`:
+:func:`state_tiles` cuts equal-valid-duration tiles per state on one common
+validity mask, :func:`state_corr_matrices` / :func:`state_corr_matrices_multi`
+turn them into Fisher-z-averaged matrices with a shift-surrogate noise floor.
+
 Temporal-dynamics extensions live in :mod:`temporal`, :mod:`ensemble`, and
 :mod:`lagged`. They power the temporal_corr notebook and answer questions
 about within-bout drift, cumulative-state-time dependence, ensemble
 stability, and lagged co-activation.
 """
 
+from ...util.validity.hypno import merge_brief_breaking_bouts
 from .aggregate import (
     aggregate_fisher_z,
     aggregate_pooled_sums,
     aggregate_simple_mean,
 )
-from ...util.validity.hypno import merge_brief_breaking_bouts
 from .bouts import (
     all_segments_in_state,
     fixed_valid_bouts,
@@ -45,9 +51,11 @@ from .ensemble import (
 from .lagged import lagged_pairwise_corr, lagged_pairwise_corr_multi
 from .outliers import bout_level_synchrony, outlier_pairs
 from .plot import (
+    CorrMatrixOrder,
     LabelOpt,
     _resolve_label,
     _safe_str,
+    corr_matrix_order,
     plot_bout_synchrony_timeline,
     plot_outlier_pairs,
     plot_pair_distribution,
@@ -64,6 +72,21 @@ from .state_compare import (
     build_state_corr_table,
     build_state_corr_table_multi,
     stratified_summaries,
+)
+from .state_matrices import (
+    ALL_LABEL,
+    StateCorrDifferences,
+    StateCorrMatrices,
+    StateTiles,
+    common_validity_mask,
+    matrix_difference,
+    pair_class_summary,
+    state_corr_matrices,
+    state_corr_matrices_multi,
+    state_differences,
+    state_sttc_matrices,
+    state_tiles,
+    timescale_sweep,
 )
 from .stats import (
     cluster_bootstrap_state,
@@ -95,6 +118,22 @@ __all__ = [
     "pairwise_pearson_corr",
     "pairwise_pearson_corr_by_bouts",
     "plot_slap2_corr_matrix",
+    "corr_matrix_order",
+    "CorrMatrixOrder",
+    # State-conditioned, duration-matched matrices (state_matrices)
+    "ALL_LABEL",
+    "StateTiles",
+    "StateCorrMatrices",
+    "common_validity_mask",
+    "state_tiles",
+    "state_corr_matrices",
+    "state_corr_matrices_multi",
+    "state_sttc_matrices",
+    "state_differences",
+    "StateCorrDifferences",
+    "timescale_sweep",
+    "pair_class_summary",
+    "matrix_difference",
     # Bouts
     "fixed_valid_bouts",
     "all_segments_in_state",

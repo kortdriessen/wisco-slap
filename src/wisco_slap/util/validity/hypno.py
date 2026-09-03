@@ -20,7 +20,7 @@ big ones."
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 import numpy as np
 import polars as pl
@@ -362,22 +362,15 @@ def valid_state_epochs(
         epochs = _tile_span(state_mask, valid_mask, epoch_samples, max_nan_samples)
 
     # Map each emitted epoch back to a bout_idx (the index of the bout
-    # whose state run contains the epoch's first sample). This requires
-    # the bouts to have been sorted by start_time, which Hypnogram
-    # guarantees via its constructor.
-    bout_starts = hypno.df["start_time"].to_numpy()
-    bout_ends = hypno.df["end_time"].to_numpy()
+    # whose state run contains the epoch's first sample), using the same
+    # half-open [start, end) rule as every other sample-to-bout lookup.
     time_values = np.asarray(mask["time"].values, dtype=float)
+    epoch_bout_idx = hypno.bout_index([time_values[a] for a, _ in epochs])
 
     rows = []
-    for a, b in epochs:
+    for (a, b), idx in zip(epochs, epoch_bout_idx, strict=True):
         a_t = float(time_values[a])
         b_t = float(time_values[b])
-        # Find which bout contains a_t (binary search on starts).
-        idx = int(np.searchsorted(bout_starts, a_t, side="right") - 1)
-        if idx < 0 or idx >= len(bout_starts) or a_t > bout_ends[idx]:
-            # Should not happen given how a was selected, but guard anyway.
-            idx = -1
         rows.append(
             {
                 "state": state,
@@ -385,7 +378,7 @@ def valid_state_epochs(
                 "end_time": b_t,
                 "valid_duration": float(epoch_samples) * dt,
                 "wall_duration": float(b - a + 1) * dt,
-                "bout_idx": idx,
+                "bout_idx": int(idx),
             }
         )
 
@@ -414,11 +407,9 @@ def add_valid_duration(hypno, mask: xr.DataArray):
     the bout and whose validity is True, then multiplies by the mask's
     median sample spacing to get seconds.
 
-    Sample-to-bout assignment uses the same boundary semantics as
-    ``Hypnogram.covers_time``: a sample at time ``t`` belongs to bout
-    ``i`` iff ``start_time[i] <= t <= end_time[i]``, with adjacent bouts
-    (``end_time[i] == start_time[i+1]``) splitting the shared sample to
-    neither side.
+    Sample-to-bout assignment is ``Hypnogram.bout_index``: bouts are
+    half-open ``[start_time, end_time)``, so a sample sitting on the
+    boundary between two contiguous bouts is counted for the later one.
 
     Parameters
     ----------
@@ -445,24 +436,14 @@ def add_valid_duration(hypno, mask: xr.DataArray):
     dt = _median_dt(time_values)
     valid = np.asarray(mask.values, dtype=bool)
 
-    starts = hypno.df["start_time"].to_numpy()
-    ends = hypno.df["end_time"].to_numpy()
+    n_bouts = hypno.df.height
+    bout_idx = hypno.bout_index(time_values)
 
-    start_idx = np.searchsorted(starts, time_values, side="right") - 1
-    end_idx = np.searchsorted(ends, time_values, side="left")
-    in_bout = (
-        (start_idx == end_idx)
-        & (start_idx >= 0)
-        & (start_idx < len(starts))
-    )
-
-    eligible = in_bout & valid
+    eligible = (bout_idx >= 0) & valid
     if eligible.any():
-        valid_counts = np.bincount(
-            start_idx[eligible], minlength=len(starts)
-        )
+        valid_counts = np.bincount(bout_idx[eligible], minlength=n_bouts)
     else:
-        valid_counts = np.zeros(len(starts), dtype=np.int64)
+        valid_counts = np.zeros(n_bouts, dtype=np.int64)
 
     valid_durations = valid_counts.astype(np.float64) * dt
 

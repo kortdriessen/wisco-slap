@@ -1,8 +1,8 @@
 import os
 
-import electro_py as epy
 import xarray as xr
 
+import electro_py as epy
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
 

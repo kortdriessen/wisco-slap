@@ -263,3 +263,34 @@ def synid_labels(
             ])
 
     return idf
+
+
+def soma_SynIDs(
+    subject: str, exp: str, loc: str, acq: str, soma: str
+) -> dict[int, list[int]]:
+    """Get a per-dmd list of synapse IDs that belong to a given soma AND have a dendrite-ID.
+
+    Parameters
+    ----------
+    subject, exp, loc, acq : str
+        Acquisition identifiers.
+    soma_id : str
+        Soma identifier.
+
+    Returns
+    -------
+    list[int]
+        List of synapse IDs associated with the specified soma.
+    """
+    sid = wis.get.synid_labels(subject, exp, loc, acq)
+    soma_sid = sid.filter(pl.col("soma-ID") == soma).filter(
+        pl.col("dend-ID").is_not_null()
+    )
+    soma_valid_ids = {}
+    for dmd_num in [1, 2]:
+        dmd_df = soma_sid.filter(pl.col("dmd") == dmd_num)
+        if len(dmd_df) > 0:
+            soma_valid_ids[dmd_num] = dmd_df["syn_id"].to_numpy()
+        else:
+            soma_valid_ids[dmd_num] = []
+    return soma_valid_ids

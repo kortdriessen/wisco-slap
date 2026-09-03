@@ -2,11 +2,10 @@
 # MAIN FUNCTIONS FOR WORKING WITH DATA ANNOTATIONS (see SeeQt package for annotation software)
 # ====================================================================================
 
-import wisco_slap as wis
-import wisco_slap.defs as DEFS
 import pandas as pd
-import os
+
 import electro_py as epy
+import wisco_slap.defs as DEFS
 
 
 def load_annotation_csv(path: str, reformat: bool = True) -> pd.DataFrame:
@@ -43,7 +42,7 @@ def load_auto_hypno(
     rename=True,
 ):
     hypno_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sync_block}/hypnograms/model_labelled"
-    hypno_name = f"raw_epochs.csv"
+    hypno_name = "raw_epochs.csv"
     epoch_df = pd.read_csv(f"{hypno_dir}/{hypno_name}")
     if filter_unclear is not None:
         if filter_on == "smooth":

@@ -15,11 +15,10 @@ Not touched by this module (intentionally):
 
 - ``acquisition_master.yaml`` — source of truth, maintained by hand.
 - ``sb_scoring_times.yaml`` — user-curated sleep-scoring time windows.
-- Annotation materials, scopex zarrs, event detection, sync-block data
-  — these are content, not meta. Each has its own monitor/orchestrator
-  (``annotation_mat_mon``, ``scopex_mon``, ``glu_ev_basic_mon``,
-  ``sync_block_mon``); they are deliberately NOT bundled here so that
-  a meta refresh stays cheap.
+- Annotation materials, scopex zarrs, sync-block data — these are
+  content, not meta. Each has its own monitor/orchestrator
+  (``annotation_mat_mon``, ``scopex_mon``, ``sync_block_mon``); they
+  are deliberately NOT bundled here so that a meta refresh stays cheap.
 
 Error handling
 --------------
@@ -38,7 +37,6 @@ The presence of a file in ``meta_issues/`` always means "still broken."
 
 from __future__ import annotations
 
-import os
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -312,8 +310,6 @@ def _stage_audit(result: MetaUpdateResult) -> None:
             detail = (
                 row.get("scopex_details")
                 or row.get("annotation_details")
-                or row.get("events_matchfilt_details")
-                or row.get("events_denoised_details")
                 or "(no detail)"
             )
             path.write_text(
@@ -356,9 +352,11 @@ def update(
 
     Iterates all acquisitions in ``acquisition_master.yaml`` and runs:
 
-    1. ExSum mirror (per acq) — copies raw ``Summary*.mat`` into
+    1. ExSum mirror (per acq) — copies ``Summary*.mat`` from the ExSum
+       source of truth (``defs.exsum_source_root``) into
        ``ExSum_mirrors/`` if out-of-date; updates ``prepro_info.yaml``
-       as a side effect.
+       as a side effect. When the source has no ExSum, an existing
+       mirror file is kept.
     2. ``sync_info.yaml`` (per subject+exp) — detects sync blocks and
        ephys offsets.
     3. ``epoch_info.yaml`` (per subject+exp) — per-epoch info for

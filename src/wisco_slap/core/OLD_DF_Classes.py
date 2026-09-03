@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union, Callable, Any
+from typing import Any, Union
+
 import polars as pl
 
 TimeLike = Union[int, float]

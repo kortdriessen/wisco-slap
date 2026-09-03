@@ -23,9 +23,9 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-import slap2_py as spy
 import tifffile as tiff
 
+import slap2_py as spy
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
 from wisco_slap.pns import annotation_materials
@@ -838,6 +838,124 @@ def acq_data(
         _write_marker(acq_root / "roi_locations", audit.esum_version)
 
     return audit_acq(subject, exp, loc, acq)
+
+
+def restore_synID_labels(
+    subject: str,
+    exp: str,
+    loc: str,
+    acq: str,
+    backup_timestamp: str | None = None,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> list[Path]:
+    """Restore archived ``synapse_labels.csv`` files from ``stale_backups``.
+
+    Copies each ``synapse_ids/dmd-*/synapse_labels.csv`` found in one
+    ``attachments/stale_backups/<timestamp>/`` folder back to its live
+    location. The archived copy is left in place as a permanent backup.
+
+    Intended for footprint-identity-preserved acquisitions, where the labels
+    archived by :func:`acq_data` remain 1:1 valid against the regenerated
+    synapse IDs. Each restored CSV is validated against the current
+    ``source_location_key.npz``: its ``source-ID`` column must be exactly
+    ``0..N-1`` for the current source count. Acquisitions whose footprints
+    changed must instead go through the footprint-matching pipeline.
+
+    Parameters
+    ----------
+    subject, exp, loc, acq : str
+        Acquisition identifiers.
+    backup_timestamp : str, optional
+        Name of the ``stale_backups`` subfolder to restore from. Defaults to
+        the newest one.
+    overwrite : bool, optional
+        Allow replacing a live ``synapse_labels.csv``. By default a live
+        file is never touched (a fresh :func:`acq_data` repair leaves none).
+    dry_run : bool, optional
+        Print planned restores without copying.
+
+    Returns
+    -------
+    list[Path]
+        Live paths of the restored (or, in dry-run, would-be-restored) CSVs.
+    """
+    tag = f"{subject} {exp} {loc} {acq}"
+    acq_root = _acq_dir(subject, exp, loc, acq)
+    backups_root = acq_root / "attachments" / "stale_backups"
+    if not backups_root.is_dir():
+        raise FileNotFoundError(f"No stale_backups directory at {backups_root}")
+
+    if backup_timestamp is not None:
+        backup_dir = backups_root / backup_timestamp
+        if not backup_dir.is_dir():
+            raise FileNotFoundError(f"No backup folder {backup_dir}")
+    else:
+        candidates = sorted(p for p in backups_root.iterdir() if p.is_dir())
+        if not candidates:
+            raise FileNotFoundError(f"No backup folders inside {backups_root}")
+        backup_dir = candidates[-1]  # timestamp names sort chronologically
+
+    archived = sorted(backup_dir.glob("synapse_ids/dmd-*/synapse_labels.csv"))
+    if not archived:
+        with_labels = sorted(
+            p.name
+            for p in backups_root.iterdir()
+            if p.is_dir() and any(p.glob("synapse_ids/dmd-*/synapse_labels.csv"))
+        )
+        raise FileNotFoundError(
+            f"No archived synapse_labels.csv in {backup_dir}. "
+            f"Backups that do contain labels: {with_labels or 'none'}"
+        )
+
+    restored: list[Path] = []
+    for src in archived:
+        dest = acq_root / src.relative_to(backup_dir)
+
+        if dest.exists() and not overwrite:
+            raise FileExistsError(
+                f"{dest} already exists — pass overwrite=True to replace it"
+            )
+
+        # Validate against the current (regenerated) source count.
+        key_path = dest.parent / "source_location_key.npz"
+        if key_path.exists():
+            _, id_list = _load_existing_key(key_path)
+            # build_synapse_id_list duplicates "0" at the front for N > 0.
+            n_sources = max(len(id_list) - 1, 0)
+            # The roladex writes one row per PNG, including a non-numeric
+            # "master_image" row — only the numeric rows are source labels.
+            raw_ids = pl.read_csv(
+                src,
+                columns=["source-ID"],
+                schema_overrides={"source-ID": pl.String},
+            )["source-ID"].to_list()
+            source_ids = sorted(
+                int(s) for s in raw_ids if s is not None and s.isdigit()
+            )
+            if source_ids != list(range(n_sources)):
+                raise ValueError(
+                    f"{_relpath(src, acq_root)} has source-IDs that do not "
+                    f"match the current {n_sources} sources — this acq needs "
+                    f"the footprint-matching pipeline, not a plain restore"
+                )
+        else:
+            print(
+                f"[{tag}] WARNING: {_relpath(key_path, acq_root)} not found — "
+                f"restoring without source-count validation"
+            )
+
+        if dry_run:
+            print(f"[{tag}] DRY RUN: would restore {_relpath(dest, acq_root)}")
+        else:
+            shutil.copyfile(src, dest)
+            print(
+                f"[{tag}] restored {_relpath(dest, acq_root)} "
+                f"from {backup_dir.name}"
+            )
+        restored.append(dest)
+
+    return restored
 
 
 def exp_data(

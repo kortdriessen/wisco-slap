@@ -43,8 +43,9 @@ def plot_event_dendrite_tree(
     Parameters
     ----------
     events
-        Polars or pandas-like dataframe containing one row per detected event.
-        The default column names match ``wis.get.glu_events_basic(...)`` output.
+        Polars or pandas-like dataframe containing one row per detected event,
+        with (by default) ``soma-ID``, ``dend-ID``, ``dmd``, and ``syn_id``
+        columns.
     subject, exp, loc, acq
         Optional acquisition identity. If all four are supplied, soma DMD/depth
         labels are resolved from ``analysis_materials/dmd_info.yaml`` via

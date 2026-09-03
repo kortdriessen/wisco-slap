@@ -120,6 +120,16 @@ class ScopeXAccessor:
         """
         return self._obj.sel(syn_id=self._obj["soma-ID"] == soma_id)
 
+    def dmd(self, dmd_id: int) -> xr.DataArray:
+        """Select synapse(s) belonging to a specific soma.
+
+        Parameters
+        ----------
+        soma_id : str
+            Soma identifier.
+        """
+        return self._obj.sel(syn_id=self._obj["dmd"] == dmd_id)
+
     def dendtype(self, dend_type: str) -> xr.DataArray:
         """Select synapse(s) by dendrite type.
 

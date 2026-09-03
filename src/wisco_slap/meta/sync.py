@@ -4,12 +4,12 @@
 
 import os
 
-import electro_py as epy
 import numpy as np
 import pandas as pd
-import slap2_py as spy
 import yaml
 
+import electro_py as epy
+import slap2_py as spy
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
 from wisco_slap.meta.get import sync_info
@@ -29,9 +29,9 @@ def load_sync_block(
     sync_block : int
         The sync block number.
     """
+    sync_blocks, sync_paths = get_all_sync_paths(subject, exp)
+    sync_path = sync_paths[sync_block - 1]
     try:
-        sync_blocks, sync_paths = get_all_sync_paths(subject, exp)
-        sync_path = sync_paths[sync_block - 1]
         print(f"Loading sync block {sync_block} from {sync_path}")
         full_sync = spy.utils.drec.load_datarec_file(sync_path)
         return (
@@ -39,7 +39,50 @@ def load_sync_block(
             full_sync["electrophysiology"][:],
         )
     except OSError:
-        return "Corrupt", "Corrupt"
+        recovered = recovered_sync_path(subject, exp, sync_block)
+        if recovered is None:
+            return "Corrupt", "Corrupt"
+        print(
+            f"Raw SYNC file is corrupt; using recovered copy {recovered} "
+            "(see slap2_py.utils.sync_recovery)"
+        )
+        full_sync = spy.utils.drec.load_datarec_file(recovered)
+        return (
+            full_sync["slap2_acquiring_trigger"][:],
+            full_sync["electrophysiology"][:],
+        )
+
+
+def recovered_sync_path(subject: str, exp: str, sync_block: int) -> str | None:
+    """Path of a recovered copy of this block's SYNC file, or None.
+
+    Recovered files live at ``defs.sync_recovery_root/<subject>/<exp>/`` under
+    the raw file's basename (written by ``slap2_py.utils.sync_recovery`` /
+    ``wisco-slap/recover_sync_layout.py``).
+    """
+    sync_blocks, sync_paths = get_all_sync_paths(subject, exp)
+    if sync_block - 1 >= len(sync_paths):
+        return None
+    candidate = os.path.join(
+        DEFS.sync_recovery_root,
+        subject,
+        exp,
+        os.path.basename(sync_paths[sync_block - 1]),
+    )
+    return candidate if os.path.isfile(candidate) else None
+
+
+def sync_source(subject: str, exp: str, sync_block: int) -> str:
+    """``"raw"`` if the raw SYNC file opens, ``"recovered"`` if only a
+    recovered copy does, else ``"corrupt"``."""
+    sync_blocks, sync_paths = get_all_sync_paths(subject, exp)
+    try:
+        with spy.utils.drec.load_datarec_file(sync_paths[sync_block - 1]):
+            return "raw"
+    except OSError:
+        return (
+            "recovered" if recovered_sync_path(subject, exp, sync_block) else "corrupt"
+        )
 
 
 def get_all_sync_paths(subject, exp) -> tuple[list[int], list[str]]:
@@ -66,16 +109,214 @@ def get_all_sync_paths(subject, exp) -> tuple[list[int], list[str]]:
     return sync_blocks, sync_paths
 
 
-def detect_ephys_start_sample(ephys, fs=5000):
+#: Warn when the best-matching acquisition onset is further than this from
+#: the wall-clock gap between the DAT filename timestamp and the TDT block start.
+MATCH_WARN_S = 30.0
+
+
+def load_pulse_channel(subject: str, exp: str, sync_block: int) -> np.ndarray | None:
+    """Return the shared-pulse channel ('rz_pulse') from a SYNC file, or None.
+
+    The RZ2 pulse-generator gizmo (standing setup since 2026-08-31) is teed
+    into both a TDT store ('p_in') and a vDaq DataRecorder channel
+    ('rz_pulse'); blocks recorded before that simply lack the channel.
+    """
+    _sbs, sps = get_all_sync_paths(subject, exp)
+    try:
+        f = spy.utils.drec.load_datarec_file(sps[_sbs.index(sync_block)])
+    except OSError:
+        # mirror load_sync_block's fallback to a recovered copy
+        recovered = recovered_sync_path(subject, exp, sync_block)
+        if recovered is None:
+            return None
+        f = spy.utils.drec.load_datarec_file(recovered)
+    if "rz_pulse" not in f:
+        return None
+    return f["rz_pulse"][:]
+
+
+def _rising_edges_subsample(x: np.ndarray, thresh: float) -> np.ndarray:
+    """Fractional sample indices where x rises through thresh."""
+    x = np.asarray(x, dtype=float)
+    k = np.flatnonzero((x[:-1] < thresh) & (x[1:] >= thresh))
+    return k + (thresh - x[k]) / (x[k + 1] - x[k])
+
+
+def calibrate_block_from_pulses(
+    pulse_vdaq: np.ndarray,
+    tdt_block_path: str,
+    coarse_anchor_idx: float,
+    fs: float = 5000.0,
+) -> dict | None:
+    """Per-block clock calibration from the shared RZ2 pulse train.
+
+    Pairs rising edges of the vDaq 'rz_pulse' channel with the same physical
+    edges on the TDT side (the 'p_in' loopback store; 'spul' epoc onsets as a
+    fallback, which adds the ~0.27 ms DAC->analog-in loopback latency to the
+    anchor) and fits ``vdaq_idx = anchor + t_tdt * fs * ratio``.
+
+    ``coarse_anchor_idx`` (the #Enable-rise sample, accurate to ~+/-0.5 ms)
+    disambiguates pulse pairing; the returned anchor supersedes it at
+    ~+/-0.05 ms precision.
+
+    Returns ``{"pulse_anchor_idx", "pulse_clock_ratio", "pulse_n",
+    "pulse_resid_ms", "pulse_source"}`` or None (with a printed reason) when
+    the block has no usable train or the fit fails sanity gates — callers
+    should then fall back to the enable-rise + fleet-constant method.
+    """
+    import tdt as _tdt
+
+    # TDT-side pulse times (seconds on the block's time base)
+    t_tdt, source = None, None
+    try:
+        blk = _tdt.read_block(tdt_block_path, store="p_in")
+        pin = np.ravel(blk.streams.p_in.data)
+        thr = (np.percentile(pin, 1) + np.percentile(pin, 99.9)) / 2
+        if thr > 0.1:  # a real train, not noise
+            t_tdt = _rising_edges_subsample(pin, thr) / float(blk.streams.p_in.fs)
+            source = "p_in"
+    except Exception:
+        pass
+    if t_tdt is None or len(t_tdt) < 30:
+        try:
+            blk = _tdt.read_block(tdt_block_path, evtype=["epocs"])
+            t_tdt = np.asarray(blk.epocs.spul.onset, dtype=float)
+            source = "spul_epocs"
+        except Exception:
+            print("pulse calibration: no p_in store / spul epocs in TDT block")
+            return None
+    if len(t_tdt) < 30:
+        print(f"pulse calibration: only {len(t_tdt)} TDT pulses — skipping")
+        return None
+
+    # vDaq-side edges
+    thr_v = (np.percentile(pulse_vdaq, 1) + np.percentile(pulse_vdaq, 99.9)) / 2
+    if thr_v < 0.1:
+        print("pulse calibration: vDaq rz_pulse channel carries no train")
+        return None
+    e_vdaq = _rising_edges_subsample(pulse_vdaq, thr_v)
+
+    # pair via the coarse anchor; window well under the pulse period
+    period = float(np.median(np.diff(t_tdt)))
+    win = min(0.25, 0.4 * period)
+    t_v = e_vdaq / fs
+    pairs = []
+    for t in t_tdt:
+        j = np.argmin(np.abs(t_v - (t + coarse_anchor_idx / fs)))
+        if abs(t_v[j] - (t + coarse_anchor_idx / fs)) < win:
+            pairs.append((e_vdaq[j], t))
+    pairs = np.array(pairs)
+    if len(pairs) < 30:
+        print(f"pulse calibration: only {len(pairs)} paired pulses — skipping")
+        return None
+
+    X = np.vstack([np.ones(len(pairs)), pairs[:, 1]]).T
+    (anchor, slope), *_ = np.linalg.lstsq(X, pairs[:, 0], rcond=None)
+    ratio = slope / fs
+    resid_ms = (pairs[:, 0] - X @ np.array([anchor, slope])) / fs * 1e3
+    resid_sd = float(resid_ms.std(ddof=1))
+    if abs(ratio - 1) > 100e-6 or resid_sd > 2.0:
+        print(
+            f"pulse calibration failed sanity gates (ratio {(ratio - 1) * 1e6:+.1f} ppm, "
+            f"resid SD {resid_sd:.2f} ms) — falling back to enable-rise method"
+        )
+        return None
+    print(
+        f"pulse calibration [{source}]: {len(pairs)} pulses, anchor "
+        f"{anchor:.1f} (vs rise {coarse_anchor_idx:.0f}: "
+        f"{(anchor - coarse_anchor_idx) / fs * 1e3:+.2f} ms), ratio "
+        f"{(ratio - 1) * 1e6:+.3f} ppm, resid SD {resid_sd:.3f} ms"
+    )
+    return {
+        "pulse_anchor_idx": float(anchor),
+        "pulse_clock_ratio": float(ratio),
+        "pulse_n": int(len(pairs)),
+        "pulse_resid_ms": resid_sd,
+        "pulse_source": source,
+    }
+
+
+def resolve_ephys_start_sample(
+    ephys: np.ndarray,
+    override: int | None = None,
+    stored: int | None = None,
+    fs: int = 5000,
+) -> tuple[int, str]:
+    """Pick the ephys-ON sample for a sync block: override > stored > detector.
+
+    Returns ``(sample, source)`` with source ``"override"``, ``"stored"`` or
+    ``"detector"``. ``stored`` is the value persisted in ``sync_info.yaml``
+    (``sync_blocks[<b>].ephys_start_sample``) by a previous run; reusing it
+    keeps ``redo=True`` reproducible for blocks where the auto-detector fails
+    and a manual override was supplied once.
+    """
+    if override is not None:
+        return int(override), "override"
+    if stored is not None:
+        return int(stored), "stored"
+    return detect_ephys_start_sample(ephys, fs=fs), "detector"
+
+
+def ephys_edge_near(
+    signal: np.ndarray, sample: int, tol: int = 3, win: int = 20
+) -> bool:
+    """True if the ephys sync line switches ON (steps up) within ``sample ± tol``.
+
+    Compares the ``win`` samples just before ``sample - tol`` with the ``win``
+    samples just after ``sample + tol``: the post level must exceed 3x the
+    largest pre magnitude (the rule :func:`detect_ephys_start_sample` applies
+    globally) and the step must be > 5x the larger of the two windows' standard
+    deviations. Works for a 3.3 V TTL as well as for the SYNC file's ephys
+    copy, whose "on" step is often only ~0.1 V on a quiet baseline.
+    """
+    signal = np.asarray(signal)
+    if not 0 <= sample < signal.size:
+        return False
+    pre = signal[max(0, sample - tol - win) : max(0, sample - tol)]
+    post = signal[sample + tol + 1 : sample + tol + 1 + win]
+    if pre.size < 5 or post.size < 5:
+        return False
+    pre_level = float(np.median(pre))
+    post_level = float(np.median(post))
+    noise = max(float(np.std(pre)), float(np.std(post)), 1e-9)
+    return post_level - pre_level > 5 * noise and post_level > 3 * float(
+        np.max(np.abs(pre))
+    )
+
+
+def detect_ephys_start_sample(ephys: np.ndarray, fs: int = 5000) -> int:
+    """Return the first SYNC sample where the ephys sync line switches on.
+
+    The threshold is ``3 x max(ephys[:2 s])``, i.e. the line is assumed to be
+    quiet for the first two seconds of the SYNC file.
+
+    Raises
+    ------
+    ValueError
+        If no sample exceeds the threshold — typically because the ephys line
+        was already high when the SYNC recording started. Pass an explicit
+        ``ephys_start_sample`` to :func:`update_sync_info` in that case.
+    """
     thresh = np.max(ephys[: int(fs * 2)]) * 3
     samples = np.where(ephys > thresh)[0]
-    return samples[0]
+    if samples.size == 0:
+        raise ValueError(
+            "ephys start not detected: no SYNC sample exceeds 3 x max(first 2 s) "
+            f"(= {thresh:.3f}); the ephys line was probably already high at the "
+            "start of the SYNC file. Pass ephys_start_sample=... explicitly."
+        )
+    return int(samples[0])
 
 
 def get_acq_sync_block(subject, exp, loc, acq):
     si = sync_info()
     key = f"{loc}--{acq}"
     return si[subject][exp]["acquisitions"][key]["sync_block"]
+
+
+def get_all_exp_sync_blocks(subject, exp):
+    si = sync_info()
+    return list(si[subject][exp]["sync_blocks"].keys())
 
 
 def get_ephys_coverage(subject, exp):
@@ -119,7 +360,13 @@ def load_all_sync_blocks(subject, exp):
 
 
 def match_scope_up_window(
-    scope, ephys, dat_start, ephys_start_ts, fs=5000, ephys_start_sample=None
+    scope,
+    ephys,
+    dat_start,
+    ephys_start_ts,
+    fs=5000,
+    ephys_start_sample=None,
+    clock_ratio=None,
 ):
     """Pure offset-matcher: given a SYNC file's scope and ephys channels, a
     microscope acquisition wall-clock start, and the TDT block's wall-clock
@@ -127,6 +374,13 @@ def match_scope_up_window(
 
     Extracted from ``compute_ephys_offset`` so it can be called per-epoch
     (with a different ``dat_start`` for each epoch) as well as per-acq.
+
+    Candidate acquisition starts are the acquisition-signature onsets from
+    :func:`slap2_py.utils.drec.generate_acq_segment_df` (trigger duty >= 0.9
+    per second, sustained >= 10 s, onset refined to the sample); the one whose
+    rise-anchored offset is closest to the wall-clock gap
+    ``|dat_start - ephys_start_ts|`` wins. Scope-UP windows from
+    :func:`generate_scope_index_df` are used only if no such segment exists.
 
     Parameters
     ----------
@@ -141,37 +395,76 @@ def match_scope_up_window(
         ``sync_blocks[<block>].ephys_start``).
     fs : int, optional
         SYNC file sampling rate in Hz, by default 5000.
-    ephys_start_sample : int, optional
-        Pre-detected ephys-ON sample index. If None, auto-detected via
-        :func:`detect_ephys_start_sample`.
+    ephys_start_sample : int or float, optional
+        The vDaq sample index of TDT t=0. If None, auto-detected via
+        :func:`detect_ephys_start_sample` (the #Enable rise). Blocks with the
+        shared pulse train pass the (fractional) pulse-fit anchor instead.
+    clock_ratio : float, optional
+        vDaq-seconds per TDT-second for this block. None uses the fleet
+        constant ``defs.VDAQ_TDT_CLOCK_RATIO``; blocks with the shared pulse
+        train pass their own measured ratio.
 
     Returns
     -------
     float
-        ``ephys_offset`` in seconds — i.e. seconds from the TDT block's start
-        to this acquisition/epoch's start.
+        ``ephys_offset`` in TDT-clock seconds — i.e. seconds from the TDT
+        block's start to this acquisition/epoch's start. The raw vDaq-sample
+        measurement is divided by ``clock_ratio`` (the ~-4 ppm clock-rate
+        difference between the recorders), so the returned value is directly
+        comparable to TDT-native time axes (EEG stores, pupil frame times).
     """
-    scope_df = spy.utils.drec.generate_scope_index_df(scope)
+    if clock_ratio is None:
+        clock_ratio = DEFS.VDAQ_TDT_CLOCK_RATIO
+    # Candidate acquisition starts. The trigger line is high ~99 % of the time
+    # while acquiring but toggles slowly during preview scanning, and the
+    # hysteresis scope-UP detector merges a preview episode that runs straight
+    # into an acquisition into one window whose start is the *preview* start
+    # (this produced offsets wrong by 158-2312 s on three acqs, 2026-08-31).
+    # So match on acquisition-signature onsets; fall back to scope-UP windows
+    # only when no such segment exists.
+    cands = spy.utils.drec.generate_acq_segment_df(scope, fs=fs)
+    kind = "acquisition segment"
+    if cands.empty:
+        cands = spy.utils.drec.generate_scope_index_df(scope, fs=fs)
+        kind = "scope-UP window (no acquisition-duty segment found)"
+    if cands.empty:
+        raise ValueError(
+            "no acquisition segment or scope-UP window found in the SYNC scope channel"
+        )
     if ephys_start_sample is None:
-        ephys_start_sample = detect_ephys_start_sample(ephys)
-    scope_df["ephys_up"] = ephys_start_sample
-    scope_df["ephys_scope_diff"] = scope_df["start_idx"] - scope_df["ephys_up"]
-    scope_df["ephys_scope_diff_s"] = scope_df["ephys_scope_diff"] / fs
+        ephys_start_sample = detect_ephys_start_sample(ephys, fs=fs)
 
+    starts = cands["start_idx"].to_numpy().astype(int)
+    diff_samples = starts - float(ephys_start_sample)
     est_start = pd.Timestamp(dat_start)
     ephys_start = pd.Timestamp(ephys_start_ts)
     wall_gap_abs = np.abs((ephys_start - est_start).total_seconds())
-    est_start_differential = np.abs(scope_df["ephys_scope_diff_s"] - wall_gap_abs)
-    scope_df["est_start_differential"] = est_start_differential
-    print(scope_df["est_start_differential"].min())
-    ephys_offset = scope_df.loc[
-        scope_df["est_start_differential"].idxmin(), "ephys_scope_diff"
-    ]
-    return ephys_offset / fs
+    differential = np.abs(diff_samples / fs - wall_gap_abs)
+    i = int(np.argmin(differential))
+    print(
+        f"matched {kind} {i + 1}/{len(starts)} at SYNC sample {starts[i]}: "
+        f"offset {diff_samples[i] / fs:.4f} s (vDaq), wall-clock gap "
+        f"{wall_gap_abs:.1f} s, mismatch {differential[i]:.1f} s"
+    )
+    if differential[i] > MATCH_WARN_S:
+        print(
+            f"WARNING: best candidate is {differential[i]:.1f} s from the wall-clock "
+            "gap — check the DAT timestamp / TDT block start / SYNC scope channel"
+        )
+    return diff_samples[i] / fs / clock_ratio
 
 
 def compute_ephys_offset(
-    subject, exp, loc, acq, si, scope=None, ephys=None, fs=5000, ephys_start_sample=None
+    subject,
+    exp,
+    loc,
+    acq,
+    si,
+    scope=None,
+    ephys=None,
+    fs=5000,
+    ephys_start_sample=None,
+    clock_ratio=None,
 ):
     """Compute ephys_offset for an acq by looking up sync-block + dat_start
     in sync_info, loading the SYNC file if needed, and running the matcher.
@@ -184,12 +477,15 @@ def compute_ephys_offset(
     if scope is None and ephys is None:
         scope, ephys = load_sync_block(subject, exp, block)
     dat_start = pd.Timestamp(si[subject][exp]["acquisitions"][acq_id]["dat_start"])
-    ephys_start_ts = pd.Timestamp(
-        si[subject][exp]["sync_blocks"][block]["ephys_start"]
-    )
+    ephys_start_ts = pd.Timestamp(si[subject][exp]["sync_blocks"][block]["ephys_start"])
     return match_scope_up_window(
-        scope, ephys, dat_start, ephys_start_ts, fs=fs,
+        scope,
+        ephys,
+        dat_start,
+        ephys_start_ts,
+        fs=fs,
         ephys_start_sample=ephys_start_sample,
+        clock_ratio=clock_ratio,
     )
 
 
@@ -341,9 +637,15 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
     exp : str
         experiment name
     redo : bool, optional
-        whether to redo the sync info, by default False
+        Recompute every sync block and acquisition entry for this experiment
+        (the ephys_offset matcher is re-run). Existing ``dat_start`` values and
+        each block's persisted ``ephys_start_sample`` are preserved, so a redo
+        is reproducible even for blocks that once needed a manual override.
+        Delete an entry from ``sync_info.yaml`` to force re-derivation.
     ephys_start_sample : dict, optional
-        dictionary mapping acquisition IDs to their corresponding ephys start samples, by default None
+        ``{"loc_X--acq_N": <sample>}`` manual ephys-ON sample overrides. An
+        override applies to the whole sync block the acquisition belongs to and
+        is persisted as ``sync_blocks[<b>].ephys_start_sample``.
     """
     si = sync_info()
     if si is None:
@@ -355,10 +657,13 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
         si[subject][exp]["sync_blocks"] = {}
         si[subject][exp]["acquisitions"] = {}
 
+    # Acquisitions to (re)fit: new ones, or every one when redo=True. (Before
+    # 2026-08-31 redo only rebuilt the sync_blocks metadata and silently left
+    # every existing ephys_offset untouched.)
     acqs = []
     acqs_all = wis.meta.get.unique_acquisitions_per_experiment(subject, exp)
     for acq_id in acqs_all:
-        if acq_id not in si[subject][exp]["acquisitions"].keys():
+        if redo or acq_id not in si[subject][exp]["acquisitions"].keys():
             loc, acq = acq_id.split("--")
             if _has_first_cycle_dat_file(subject, exp, loc, acq):
                 acqs.append(acq_id)
@@ -378,9 +683,7 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
         if "n_epochs" not in entry and _has_first_cycle_dat_file(
             subject, exp, loc, acq
         ):
-            entry["n_epochs"] = len(
-                _list_epoch_start_times(subject, exp, loc, acq)
-            )
+            entry["n_epochs"] = len(_list_epoch_start_times(subject, exp, loc, acq))
             backfilled = True
 
     if len(acqs) == 0 and not redo:
@@ -404,7 +707,12 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
     for block in sb:
         if block in si[subject][exp]["sync_blocks"].keys() and not redo:
             continue
+        prev_block = si[subject][exp]["sync_blocks"].get(block, {})
         si[subject][exp]["sync_blocks"][block] = {}
+        if prev_block.get("ephys_start_sample") is not None:
+            si[subject][exp]["sync_blocks"][block]["ephys_start_sample"] = int(
+                prev_block["ephys_start_sample"]
+            )
         si[subject][exp]["sync_blocks"][block]["ephys_start"] = str(coverage[block][0])
         si[subject][exp]["sync_blocks"][block]["ephys_end"] = str(coverage[block][1])
         if type(scope[block]) is str and type(ephys[block]) is str:
@@ -416,10 +724,23 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
                 )
         else:
             si[subject][exp]["sync_blocks"][block]["corrupt"] = False
+            si[subject][exp]["sync_blocks"][block]["sync_source"] = sync_source(
+                subject, exp, block
+            )
 
     # Now we update the specific acquisitions with block assignments and ephys offsets
     # acqs = wis.meta.get.unique_acquisitions_per_experiment(subject, exp)
     assignments = assign_acqs_to_sync_blocks(subject, exp, acqs, coverage)
+
+    # Per-block pulse calibrations, computed lazily (once per block per run).
+    pulse_cal_cache: dict[int, dict | None] = {}
+
+    # Manual overrides are per acquisition in the call signature but physically
+    # per sync block (one SYNC file per block), so apply each to its block.
+    block_overrides: dict[int, int] = {}
+    for acq_id, sample in (ephys_start_sample or {}).items():
+        if acq_id in assignments:
+            block_overrides[assignments[acq_id]] = int(sample)
 
     for acq_id in acqs:
         loc, acq = acq_id.split("--")
@@ -428,32 +749,82 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
             f"No DMD1 first-cycle .dat file found for {subject}/{exp}/{loc}/{acq} "
             f"despite _has_first_cycle_dat_file passing — race condition?"
         )
-        dat_start = epochs[0][1]  # earliest epoch (epoch 1)
+        prev_acq = si[subject][exp]["acquisitions"].get(acq_id, {})
+        # Keep a previously stored dat_start (some carry sub-second precision
+        # from older sources; the filename timestamp is 1-s resolution).
+        dat_start = prev_acq.get("dat_start") or str(epochs[0][1])  # epoch 1
         n_epochs = len(epochs)
+        block = assignments[acq_id]
         si[subject][exp]["acquisitions"][acq_id] = {}
-        si[subject][exp]["acquisitions"][acq_id]["sync_block"] = assignments[acq_id]
+        si[subject][exp]["acquisitions"][acq_id]["sync_block"] = block
         si[subject][exp]["acquisitions"][acq_id]["dat_start"] = str(dat_start)
         si[subject][exp]["acquisitions"][acq_id]["n_epochs"] = n_epochs
-        if ephys_start_sample is not None and acq_id in ephys_start_sample.keys():
-            start_sample_to_use = ephys_start_sample[acq_id]
-        else:
-            start_sample_to_use = None
-        if si[subject][exp]["sync_blocks"][assignments[acq_id]]["corrupt"] is False:
-            offset = compute_ephys_offset(
-                subject,
-                exp,
-                loc,
-                acq,
-                si,
-                scope[assignments[acq_id]],
-                ephys[assignments[acq_id]],
-                ephys_start_sample=start_sample_to_use,
+        if si[subject][exp]["sync_blocks"][block]["corrupt"] is False:
+            block_entry = si[subject][exp]["sync_blocks"][block]
+            start_sample_to_use, start_source = resolve_ephys_start_sample(
+                ephys[block],
+                override=block_overrides.get(block),
+                stored=block_entry.get("ephys_start_sample"),
             )
-            offset = float(offset)
+            block_entry["ephys_start_sample"] = int(start_sample_to_use)
+            if start_source != "stored" or "ephys_start_source" not in block_entry:
+                block_entry["ephys_start_source"] = (
+                    block_entry.get("ephys_start_source", "stored")
+                    if start_source == "stored"
+                    else start_source
+                )
+            # Precise per-block calibration from the shared RZ2 pulse train
+            # ('rz_pulse' vDaq channel + 'p_in' TDT store), when recorded.
+            # Computed once per block per run; falls back to the enable-rise
+            # anchor + fleet-constant ratio when absent or failing gates.
+            if block not in pulse_cal_cache:
+                pulse_vdaq = load_pulse_channel(subject, exp, block)
+                if pulse_vdaq is None:
+                    pulse_cal_cache[block] = None
+                else:
+                    block_paths = wis.peri.ephys.get_block_paths(subject, exp)
+                    pulse_cal_cache[block] = calibrate_block_from_pulses(
+                        pulse_vdaq,
+                        block_paths[block - 1],
+                        coarse_anchor_idx=float(start_sample_to_use),
+                    )
+            cal = pulse_cal_cache[block]
+            if cal is not None:
+                block_entry.update(cal)
+                anchor = cal["pulse_anchor_idx"]
+                ratio = cal["pulse_clock_ratio"]
+                method = "rz_pulse"
+            else:
+                anchor = float(start_sample_to_use)
+                ratio = DEFS.VDAQ_TDT_CLOCK_RATIO
+                method = "enable_rise"
+            offset = float(
+                compute_ephys_offset(
+                    subject,
+                    exp,
+                    loc,
+                    acq,
+                    si,
+                    scope[block],
+                    ephys[block],
+                    ephys_start_sample=anchor,
+                    clock_ratio=ratio,
+                )
+            )
+            # The offset is stored in TDT-clock seconds (raw vDaq measurement
+            # / clock_ratio_applied). Keep the raw measurement alongside so
+            # the ratio can be re-applied by pure arithmetic if re-measured.
+            si[subject][exp]["acquisitions"][acq_id]["ephys_offset_uncorrected"] = (
+                offset * ratio
+            )
         else:
             offset = find_corrupted_sync_offsets(subject, exp, loc, acq, si)
             offset = float(offset) if offset is not None else None
+            ratio = DEFS.VDAQ_TDT_CLOCK_RATIO
+            method = "corrupt_fallback"
         si[subject][exp]["acquisitions"][acq_id]["ephys_offset"] = offset
+        si[subject][exp]["acquisitions"][acq_id]["clock_ratio_applied"] = ratio
+        si[subject][exp]["acquisitions"][acq_id]["offset_method"] = method
 
     # One final retry for any acquisitions still unresolved (offset is None),
     # which can happen when a corrupt acq was processed before any non-corrupt
@@ -467,9 +838,247 @@ def update_sync_info(subject, exp, redo=False, ephys_start_sample=None):
             si[subject][exp]["acquisitions"][acq_id]["ephys_offset"] = (
                 float(ephys_offset) if ephys_offset is not None else None
             )
+            si[subject][exp]["acquisitions"][acq_id]["clock_ratio_applied"] = (
+                DEFS.VDAQ_TDT_CLOCK_RATIO
+            )
 
     # write the updated sync info to the yaml file
     with open(f"{DEFS.anmat_root}/sync_info.yaml", "w") as f:
         yaml.dump(si, f)
         f.close()
     return
+
+
+# ==================================================================================
+# Backfilling ephys_start_sample for blocks whose entries predate its persistence
+# ==================================================================================
+def _acq_onset_candidates(scope: np.ndarray, fs: int = 5000) -> np.ndarray:
+    """Acquisition-signature onsets of the trigger channel (scope-UP windows as
+    a fallback) — the same candidates the matcher uses."""
+    seg = spy.utils.drec.generate_acq_segment_df(scope, fs=fs)
+    starts = seg["start_idx"].to_numpy().astype(int)
+    if starts.size == 0:
+        win = spy.utils.drec.generate_scope_index_df(scope, fs=fs)
+        starts = win["start_idx"].to_numpy().astype(int)
+    return starts
+
+
+def _vdaq_offset_s(acq_entry: dict) -> float | None:
+    """The raw vDaq-seconds offset an acquisition entry encodes."""
+    u = acq_entry.get("ephys_offset_uncorrected")
+    if u is not None:
+        return float(u)
+    off = acq_entry.get("ephys_offset")
+    if off is None:
+        return None
+    return float(off) * float(acq_entry.get("clock_ratio_applied", 1.0))
+
+
+def back_calculate_ephys_start(
+    scope: np.ndarray,
+    ephys: np.ndarray,
+    acq_entry: dict,
+    ephys_start_ts,
+    fs: int = 5000,
+) -> dict:
+    """The ephys-ON sample that one acquisition's stored offset encodes.
+
+    ``ephys_offset_uncorrected = (acq_onset − ephys_start_sample) / fs``, so
+    ``ephys_start_sample = acq_onset − round(offset · fs)`` with ``acq_onset``
+    re-derived from the trigger channel (candidate nearest the wall-clock gap,
+    anchored on the auto-detected ephys start when it fires — exactly the
+    matcher's selection). Whatever value was used when the offset was computed
+    (auto-detected or a manual override) falls out of this arithmetic.
+
+    Returns a dict with ``value`` (int or None), ``onset``, ``detector`` (int
+    or None), ``edge`` (bool: an ephys rise sits at ``value``), ``wall_gap_s``
+    and ``reason`` (why ``value`` is None).
+    """
+    scope = np.asarray(scope)
+    ephys = np.asarray(ephys)
+    out = {"value": None, "onset": None, "detector": None, "edge": False, "reason": ""}
+    try:
+        out["detector"] = detect_ephys_start_sample(ephys, fs=fs)
+    except ValueError:
+        out["detector"] = None
+    off = _vdaq_offset_s(acq_entry)
+    if off is None:
+        out["reason"] = "no ephys_offset stored"
+        return out
+    cands = _acq_onset_candidates(scope, fs=fs)
+    if cands.size == 0:
+        out["reason"] = "no acquisition onset / scope-UP window in the trigger"
+        return out
+    gap = (
+        pd.Timestamp(acq_entry["dat_start"]) - pd.Timestamp(ephys_start_ts)
+    ).total_seconds()
+    out["wall_gap_s"] = float(gap)
+    anchor = out["detector"] if out["detector"] is not None else 0
+    i = int(np.argmin(np.abs((cands - anchor) / fs - gap)))
+    out["onset"] = int(cands[i])
+    out["value"] = int(cands[i]) - int(round(off * fs))
+    out["edge"] = ephys_edge_near(ephys, out["value"])
+    if not out["edge"]:
+        out["reason"] = f"no ephys edge at back-calculated sample {out['value']}"
+    return out
+
+
+def backfill_ephys_start_samples(dry_run: bool = True, verbose: bool = True):
+    """Fill ``sync_blocks[<b>].ephys_start_sample`` for blocks that lack it.
+
+    For every non-corrupt block with at least one acquisition, back-calculate
+    the ephys-ON sample from each acquisition's stored offset
+    (:func:`back_calculate_ephys_start`). A block is written only when every
+    acquisition agrees to within one sample AND an ephys rise sits at that
+    sample. Stored values are never modified (mismatches are reported).
+    Blocks without acquisitions are left untouched — nothing uses their ephys
+    start and no override could ever have been supplied for them.
+
+    Provenance goes to ``ephys_start_source``: ``"backfill (= detector)"`` when
+    the auto-detector agrees, ``"backfill (override; detector=N|failed)"``
+    otherwise.
+
+    Parameters
+    ----------
+    dry_run
+        When True (default) nothing is written; the returned table shows what
+        would happen. When False, a timestamped backup of ``sync_info.yaml`` is
+        written first and only rows with status ``write`` are applied.
+
+    Returns
+    -------
+    polars.DataFrame
+        One row per sync block: ``subject, exp, block, n_acqs, status, value,
+        detector, source, stored, values, edge_ok, note``. ``status`` is one of
+        ``written`` / ``write`` (dry run) / ``already_stored`` / ``manual_review``
+        / ``no_acquisitions`` / ``corrupt``.
+    """
+    import polars as pl
+
+    si = sync_info()
+    rows: list[dict] = []
+    for subject in si:
+        for exp in si[subject]:
+            d = si[subject][exp]
+            for block, binfo in d["sync_blocks"].items():
+                acqs = {
+                    la: a
+                    for la, a in d["acquisitions"].items()
+                    if a.get("sync_block") == block
+                }
+                row = {
+                    "subject": subject,
+                    "exp": exp,
+                    "block": int(block),
+                    "n_acqs": len(acqs),
+                    "status": "",
+                    "value": None,
+                    "detector": None,
+                    "source": None,
+                    "stored": binfo.get("ephys_start_sample"),
+                    "values": "",
+                    "edge_ok": None,
+                    "note": "",
+                }
+                if not acqs:
+                    row["status"] = "no_acquisitions"
+                    rows.append(row)
+                    continue
+                scope, ephys = load_sync_block(subject, exp, int(block))
+                if isinstance(scope, str):
+                    row["status"] = "corrupt"
+                    rows.append(row)
+                    continue
+                results = {
+                    la: back_calculate_ephys_start(
+                        scope, ephys, a, binfo["ephys_start"]
+                    )
+                    for la, a in acqs.items()
+                }
+                vals = [r["value"] for r in results.values()]
+                row["values"] = ", ".join(
+                    f"{la}: {r['value']}{'' if r['edge'] else ' (no edge)'}"
+                    for la, r in results.items()
+                )
+                row["detector"] = next(iter(results.values()))["detector"]
+                ok = [v for v in vals if v is not None]
+                if len(ok) != len(vals) or max(ok) - min(ok) > 1:
+                    row["status"] = "manual_review"
+                    row["note"] = (
+                        "; ".join(r["reason"] for r in results.values() if r["reason"])
+                        or "acquisitions disagree on the ephys start sample"
+                    )
+                    rows.append(row)
+                    continue
+                value = int(round(float(np.median(ok))))
+                row["value"] = value
+                row["edge_ok"] = all(r["edge"] for r in results.values())
+                if not row["edge_ok"]:
+                    row["status"] = "manual_review"
+                    row["note"] = f"no ephys edge at back-calculated sample {value}"
+                    rows.append(row)
+                    continue
+                det = row["detector"]
+                if det is not None and abs(det - value) <= 1:
+                    row["source"] = "backfill (= detector)"
+                else:
+                    row["source"] = (
+                        f"backfill (override; detector={det})"
+                        if det is not None
+                        else "backfill (override; detector failed)"
+                    )
+                if row["stored"] is not None:
+                    row["status"] = "already_stored"
+                    row["note"] = (
+                        "matches"
+                        if abs(int(row["stored"]) - value) <= 1
+                        else f"MISMATCH: stored {row['stored']} vs "
+                        f"back-calculated {value}"
+                    )
+                else:
+                    row["status"] = "write"
+                rows.append(row)
+                if verbose:
+                    print(
+                        f"  {subject}/{exp} sync_block-{block}: {row['status']} "
+                        f"value={value} detector={det} ({row['source']}) {row['note']}"
+                    )
+
+    if not dry_run:
+        to_write = [r for r in rows if r["status"] == "write"]
+        if to_write:
+            import shutil
+            from datetime import datetime
+
+            path = f"{DEFS.anmat_root}/sync_info.yaml"
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(path, f"{path}.bak-{stamp}-pre-ephys-start-backfill")
+            for r in to_write:
+                b = si[r["subject"]][r["exp"]]["sync_blocks"][r["block"]]
+                b["ephys_start_sample"] = int(r["value"])
+                b["ephys_start_source"] = r["source"]
+                r["status"] = "written"
+            with open(path, "w") as f:
+                yaml.dump(si, f)
+            if verbose:
+                print(
+                    f"wrote {len(to_write)} block(s); backup at "
+                    f"{path}.bak-{stamp}-pre-ephys-start-backfill"
+                )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "subject": pl.Utf8,
+            "exp": pl.Utf8,
+            "block": pl.Int64,
+            "n_acqs": pl.Int64,
+            "status": pl.Utf8,
+            "value": pl.Int64,
+            "detector": pl.Int64,
+            "source": pl.Utf8,
+            "stored": pl.Int64,
+            "values": pl.Utf8,
+            "edge_ok": pl.Boolean,
+            "note": pl.Utf8,
+        },
+    )

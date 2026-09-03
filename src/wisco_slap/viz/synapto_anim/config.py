@@ -163,7 +163,7 @@ class SceneConfig:
         canvas_size: tuple[int, int] = (1920, 1080),
         out_path: str = "/tmp/synapto_anim.mov",
         codec: Literal["prores_ks", "qtrle", "png"] = "prores_ks",
-    ) -> "SceneConfig":
+    ) -> SceneConfig:
         """Sensible default scene for a fresh acquisition.
 
         - Canvas: 1920×1080 transparent
@@ -204,7 +204,7 @@ class SceneConfig:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SceneConfig":
+    def from_dict(cls, d: dict[str, Any]) -> SceneConfig:
         canvas = CanvasConfig(**d.get("canvas", {}))
         acq = AcquisitionConfig(**d["acquisition"])
         placements = {

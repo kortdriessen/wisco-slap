@@ -26,6 +26,13 @@ dependencies = [
     "lightgbm>=4.6.0",
     "statsmodels>=0.14.6",
     "bottleneck>=1.6.0",
+    "scipy>=1.17.1",
+    "spine-labeller",
+    "zarr>=2.18,<3",
+    "numcodecs>=0.15.1",
+    "tifffile>=2026.3.3",
+    "polars>=1.39.3",
+    "matplotlib>=3.10.8",
 ]
 
 # Dev-only deps: tools + notebooks.
@@ -44,7 +51,8 @@ build-backend = "hatchling.build"
 [tool.uv.sources]
 slap2-py = { path = "../slap2-py", editable = true }
 electro-py = { path = "../electro-py", editable = true }
-kplot = { path = "../kplot", editable = true }
+kplot = { path = "../ZWISCO_SLAP_GRAVEYARD/kplot", editable = true }
+spine-labeller = { path = "../slap_mi_2_sleep/LIVE_EXPLORATIONS/tiff_averages_for_size_estimates/spine_labeller", editable = true }
 
 # Build one wheel that contains the import package.
 [tool.hatch.build.targets.wheel]

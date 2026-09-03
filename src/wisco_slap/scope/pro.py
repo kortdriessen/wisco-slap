@@ -6,9 +6,11 @@ DataArrays (typically dims ``["channel", "syn_id", "time"]``). This module
 also includes ROI dF/F helpers for ScopeX user-defined ROIs.
 """
 
+import os
 import warnings
 
 import numpy as np
+import scipy.fft
 import xarray as xr
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.interpolate import PchipInterpolator
@@ -210,24 +212,29 @@ def _matched_filter_correlate(
     """
     klen = kernel.size
     orig_shape = data.shape
-    flat = data.reshape(-1, orig_shape[-1]).astype(np.float64)
+    # Compute in the input's float precision (float32 in, float32 math): the
+    # result is consumed as float32 anyway, single-precision FFT error is
+    # ~1e-6 of the output std, and it halves FFT time and memory traffic.
+    dtype = data.dtype if data.dtype.kind == "f" else np.dtype(np.float64)
+    flat = data.reshape(-1, orig_shape[-1]).astype(dtype, copy=False)
     n_time = flat.shape[-1]
 
     valid = np.isfinite(flat)
-    filled = np.where(valid, flat, 0.0)
+    filled = np.where(valid, flat, dtype.type(0.0))
 
     # Cross-correlation via full convolution with the reversed kernel:
     #   fftconvolve(x, kernel[::-1], 'full')[n + klen - 1] == sum_k x[n+k] kernel[k]
-    rev = kernel[::-1][np.newaxis, :]
-    full = fftconvolve(filled, rev, mode="full", axes=-1)
-    corr = full[:, klen - 1 : klen - 1 + n_time].copy()
+    rev = kernel[::-1][np.newaxis, :].astype(dtype, copy=False)
+    with scipy.fft.set_workers(min(32, os.cpu_count() or 1)):
+        full = fftconvolve(filled, rev, mode="full", axes=-1)
+        corr = full[:, klen - 1 : klen - 1 + n_time].copy()
 
-    if not valid.all():
-        # Fraction of kernel energy (sum kernel**2 == 1) landing on valid samples.
-        energy_rev = (kernel**2)[::-1][np.newaxis, :]
-        full_e = fftconvolve(valid.astype(np.float64), energy_rev, mode="full", axes=-1)
-        valid_energy = full_e[:, klen - 1 : klen - 1 + n_time]
-        corr[valid_energy < min_valid_frac] = np.nan
+        if not valid.all():
+            # Fraction of kernel energy (sum kernel**2 == 1) on valid samples.
+            energy_rev = (kernel**2)[::-1][np.newaxis, :].astype(dtype, copy=False)
+            full_e = fftconvolve(valid.astype(dtype), energy_rev, mode="full", axes=-1)
+            valid_energy = full_e[:, klen - 1 : klen - 1 + n_time]
+            corr[valid_energy < min_valid_frac] = np.nan
 
     return corr.reshape(orig_shape)
 

@@ -1,5 +1,5 @@
-"""Unified ExSum-derivative freshness audit across scopex + event detection
-+ annotation materials.
+"""Unified ExSum-derivative freshness audit across scopex + annotation
+materials.
 
 This module is the single place that produces a combined per-acquisition
 staleness row, and it is responsible for maintaining the canonical audit
@@ -9,9 +9,9 @@ this CSV to display ExSum freshness columns without having to itself
 import the three underlying auditors.
 
 Truth always comes from re-running :func:`refresh_exsum_audit`; the CSV is
-a cache. Individual auditors (``scopex_mon``, ``glu_ev_basic_mon``,
-``annotation_mat_mon``) remain the authoritative sources for their own
-components and are called by the helpers here.
+a cache. Individual auditors (``scopex_mon``, ``annotation_mat_mon``)
+remain the authoritative sources for their own components and are called
+by the helpers here.
 
 Component statuses are mapped into a shared 5-value vocabulary:
 
@@ -44,7 +44,6 @@ import wisco_slap as wis
 import wisco_slap.defs as DEFS
 from wisco_slap.pns import (
     annotation_mat_mon,
-    glu_ev_basic_mon,
     scopex_mon,
 )
 
@@ -59,6 +58,7 @@ AUDIT_CSV_PATH: Path = Path(DEFS.anmat_root) / "ExSum_audits.csv"
 _SEVERITY = {
     "fresh": 0,
     "not_applicable": 0,
+    "no_prox_lines": 0,
     "missing": 2,
     "stale": 3,
     "missing_mirror": 4,
@@ -122,57 +122,20 @@ def scopex_status(subject: str, exp: str, loc: str, acq: str) -> ComponentStatus
     )
 
 
-def event_detection_status(
-    subject: str,
-    exp: str,
-    loc: str,
-    acq: str,
-    mode: str = "matchfilt",
-) -> ComponentStatus:
-    """Freshness of event-detection outputs for one acquisition.
+def shaft_ca_status(subject: str, exp: str, loc: str, acq: str) -> ComponentStatus:
+    """Freshness of the shaft-calcium disc traces for one acquisition.
 
-    Parameters
-    ----------
-    mode : {"matchfilt", "denoised"}
-        Which pipeline variant to assess. Both modes can coexist.
+    Thin wrapper around :func:`shaft_ca_mon.check_status`. Unlike the other
+    components this one has TWO upstreams (ExSum mirror + prox_lines CSVs);
+    ``no_prox_lines`` counts as not-applicable rather than a problem.
     """
-    result = glu_ev_basic_mon.check_outputs_status(
-        subject, exp, loc, acq, mode=mode
-    )
+    from wisco_slap.pns import shaft_ca_mon
 
-    if result.status == "missing_mirror":
-        return ComponentStatus(
-            status="missing_mirror",
-            esum_version=result.esum_version,
-            details="no ExperimentSummary mirror",
-        )
-
-    if result.status == "scopex_unavailable":
-        # Treat as not_applicable: we can't meaningfully audit event
-        # detection when the upstream scopex trace isn't available. The
-        # WISynaptic dashboard already surfaces scopex status separately,
-        # so we don't double-count here.
-        return ComponentStatus(
-            status="not_applicable",
-            esum_version=result.esum_version,
-            details=f"{mode}: upstream scopex zarr not available",
-        )
-
-    if result.status == "fresh":
-        return ComponentStatus(
-            status="fresh", esum_version=result.esum_version, details=""
-        )
-
-    pieces: list[str] = []
-    if result.stale_files:
-        pieces.append("stale: " + ", ".join(result.stale_files))
-    if result.missing_files:
-        pieces.append("missing: " + ", ".join(result.missing_files))
-    detail_body = "; ".join(pieces)
+    result = shaft_ca_mon.check_status(subject, exp, loc, acq)
     return ComponentStatus(
         status=result.status,
         esum_version=result.esum_version,
-        details=f"{mode}: {detail_body}" if detail_body else f"{mode}",
+        details="; ".join(result.details),
     )
 
 
@@ -347,10 +310,8 @@ _ROW_SCHEMA: dict[str, pl.PolarsDataType] = {
     "overall_status": pl.String,
     "scopex_status": pl.String,
     "scopex_details": pl.String,
-    "events_matchfilt_status": pl.String,
-    "events_matchfilt_details": pl.String,
-    "events_denoised_status": pl.String,
-    "events_denoised_details": pl.String,
+    "shaft_ca_status": pl.String,
+    "shaft_ca_details": pl.String,
     "annotation_status": pl.String,
     "annotation_details": pl.String,
     "annotation_stale_components": pl.String,
@@ -383,22 +344,14 @@ def acq_status_row(subject: str, exp: str, loc: str, acq: str) -> dict:
     """Build a single flat dict row summarizing all ExSum-derivative
     freshness for one acquisition. Suitable for a polars DataFrame."""
     sx = scopex_status(subject, exp, loc, acq)
-    ev_m = event_detection_status(subject, exp, loc, acq, mode="matchfilt")
-    ev_d = event_detection_status(subject, exp, loc, acq, mode="denoised")
+    shaft = shaft_ca_status(subject, exp, loc, acq)
     ann, ann_audit = annotation_status(subject, exp, loc, acq)
     score = scoring_status(subject, exp, loc, acq)
 
     # Pick the version string from whichever component found one.
-    esum_version = (
-        sx.esum_version
-        or ev_m.esum_version
-        or ev_d.esum_version
-        or ann.esum_version
-    )
+    esum_version = sx.esum_version or ann.esum_version
 
-    overall = _overall_status(
-        [sx.status, ev_m.status, ev_d.status, ann.status]
-    )
+    overall = _overall_status([sx.status, shaft.status, ann.status])
 
     return {
         "subject": subject,
@@ -409,10 +362,8 @@ def acq_status_row(subject: str, exp: str, loc: str, acq: str) -> dict:
         "overall_status": overall,
         "scopex_status": sx.status,
         "scopex_details": sx.details,
-        "events_matchfilt_status": ev_m.status,
-        "events_matchfilt_details": ev_m.details,
-        "events_denoised_status": ev_d.status,
-        "events_denoised_details": ev_d.details,
+        "shaft_ca_status": shaft.status,
+        "shaft_ca_details": shaft.details,
         "annotation_status": ann.status,
         "annotation_details": ann.details,
         "annotation_stale_components": ",".join(ann_audit.stale_components),
@@ -480,10 +431,6 @@ def refresh_exsum_audit(csv_path: Path | str | None = None) -> pl.DataFrame:
                             "overall_status": "error",
                             "scopex_status": "error",
                             "scopex_details": str(exc),
-                            "events_matchfilt_status": "error",
-                            "events_matchfilt_details": str(exc),
-                            "events_denoised_status": "error",
-                            "events_denoised_details": str(exc),
                             "annotation_status": "error",
                             "annotation_details": str(exc),
                             "annotation_stale_components": "",

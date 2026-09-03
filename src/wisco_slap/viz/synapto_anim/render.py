@@ -19,10 +19,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from matplotlib.colors import LogNorm, Normalize
-from scipy.ndimage import shift as ndi_shift, zoom as ndi_zoom
+from scipy.ndimage import shift as ndi_shift
+from scipy.ndimage import zoom as ndi_zoom
 
 import slap2_py as spy
-
 from wisco_slap.core import ScopeX_class  # noqa: F401  (registers .sx accessor)
 from wisco_slap.get import syn_dF
 from wisco_slap.meta.get import esum_mirror_path
@@ -34,15 +34,15 @@ from wisco_slap.viz.synapto_overlays import (
 
 from .config import (
     DMD_KEYS,
-    AnimationConfig,
     OverlayKwargs,
     Placement,
     ReferenceImage,
     SceneConfig,
     TargetStrip,
+)
+from .config import (
     load as load_config,
 )
-
 
 # ---------------------------------------------------------------------------
 # Ordering helpers (mirrors scope/corr/plot.py)

@@ -81,3 +81,28 @@ def check_acquisition_dir_structure():
                         f"REFERENCE directory MISSING for {subject} {exp} {loc}--{acq}"
                     )
     return "Done checking acquisition directory structure."
+
+
+def validate_ids(exp: str, loc: str, acq: str) -> None:
+    """Check the ID naming conventions, to catch positional args passed out of order.
+
+    Raises
+    ------
+    ValueError
+        If ``exp``, ``loc``, or ``acq`` does not start with its expected prefix.
+    """
+    wrong = [
+        f"{name}={value!r} (expected a value starting with {prefix!r})"
+        for name, value, prefix in (
+            ("exp", exp, "exp_"),
+            ("loc", loc, "loc_"),
+            ("acq", acq, "acq_"),
+        )
+        if not value.startswith(prefix)
+    ]
+    if wrong:
+        raise ValueError(
+            "Argument(s) do not match the project naming convention: "
+            + "; ".join(wrong)
+            + ". Expected order: subject exp loc acq soma_id."
+        )

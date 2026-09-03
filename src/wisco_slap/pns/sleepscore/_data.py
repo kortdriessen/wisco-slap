@@ -14,7 +14,6 @@ import wisco_slap.defs as DEFS
 
 from ._config import STATE_NAMES, STATE_TO_IDX
 
-
 # ---------------------------------------------------------------------------
 # Session data construction
 # ---------------------------------------------------------------------------

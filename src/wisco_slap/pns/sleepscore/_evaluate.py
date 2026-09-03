@@ -14,7 +14,6 @@ from ._data import (
     validate_and_standardize_labels,
 )
 
-
 _STATE_COLORS: dict[str, str] = {
     "NREM": "#4b71e3",
     "REM": "#e34bde",
@@ -740,7 +739,7 @@ def _print_metrics(metrics: dict[str, Any], state_names: list[str], title: str =
         print(f"  {name:<12s} {m['precision']:>10.3f} {m['recall']:>10.3f} {m['f1']:>10.3f} {m['support']:>10d}")
 
     cm = metrics["confusion_matrix"]
-    print(f"\n  Confusion matrix (rows=true, cols=pred):")
+    print("\n  Confusion matrix (rows=true, cols=pred):")
     header = "  " + " " * 10 + "".join(f"{n:>8s}" for n in state_names)
     print(header)
     for i, name in enumerate(state_names):
@@ -773,7 +772,7 @@ def evaluate_loso(
     -------
     dict with ``overall`` metrics and ``per_fold`` results.
     """
-    from ._model import train_model, score_session
+    from ._model import score_session, train_model
 
     if config is None:
         config = ScoreConfig()

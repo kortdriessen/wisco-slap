@@ -70,15 +70,13 @@ EPOCH_INFO_PATH = Path(DEFS.anmat_root) / "epoch_info.yaml"
 
 # Fields every per-epoch record must have; used by the idempotency check to
 # trigger a re-compute when the schema has grown.
-_REQUIRED_EPOCH_FIELDS: frozenset[str] = frozenset(
-    (
-        "filename",
-        "duration_since_epoch_1_s",
-        "fpga_timestamp_s",
-        "sync_block",
-        "ephys_offset_s",
-    )
-)
+_REQUIRED_EPOCH_FIELDS: frozenset[str] = frozenset((
+    "filename",
+    "duration_since_epoch_1_s",
+    "fpga_timestamp_s",
+    "sync_block",
+    "ephys_offset_s",
+))
 
 
 def _load_epoch_info() -> dict:
@@ -96,9 +94,7 @@ def _save_epoch_info(d: dict) -> None:
         yaml.safe_dump(d, f, sort_keys=True)
 
 
-def _find_sync_block_for_timestamp(
-    wall_ts: pd.Timestamp, si_exp: dict
-) -> int:
+def _find_sync_block_for_timestamp(wall_ts: pd.Timestamp, si_exp: dict) -> int:
     """Return the sync_block whose ephys coverage contains ``wall_ts``.
 
     Raises ``ValueError`` if the timestamp falls in no block or in a
@@ -195,7 +191,11 @@ def _compute_epochs_for_acq(
             )
         ephys_start_ts = pd.Timestamp(si_exp["sync_blocks"][b]["ephys_start"])
         offset_s = _sync.match_scope_up_window(
-            scope, ephys, e["wall_ts"], ephys_start_ts,
+            scope,
+            ephys,
+            e["wall_ts"],
+            ephys_start_ts,
+            ephys_start_sample=si_exp["sync_blocks"][b].get("ephys_start_sample"),
         )
         block_anchor_offset_s[b] = float(offset_s)
         block_anchor_fpga_s[b] = e["fpga_s"]
@@ -204,14 +204,24 @@ def _compute_epochs_for_acq(
     out: dict = {}
     for i, e in enumerate(per_epoch, start=1):
         b = e["sync_block"]
-        fpga_delta_from_block_anchor = e["fpga_s"] - block_anchor_fpga_s[b]
+        # FPGA deltas are microscope-clock seconds; divide by the clock ratio
+        # so the offset is fully in TDT seconds (the anchor offset from
+        # match_scope_up_window is already corrected).
+        fpga_delta_from_block_anchor = (
+            e["fpga_s"] - block_anchor_fpga_s[b]
+        ) / DEFS.VDAQ_TDT_CLOCK_RATIO
         ephys_offset_s = block_anchor_offset_s[b] + fpga_delta_from_block_anchor
         out[i] = {
             "filename": e["filename"],
             "duration_since_epoch_1_s": float(e["fpga_s"] - acq_anchor_fpga_s),
             "fpga_timestamp_s": float(e["fpga_s"]),
             "sync_block": b,
+            # fully TDT-clock seconds: anchor corrected inside
+            # match_scope_up_window, FPGA delta divided by the ratio above
+            # (the SLAP2 FPGA and vDaq share a timebase — see
+            # synchronization_validation/within_acq_shear_measurements.ipynb).
             "ephys_offset_s": float(ephys_offset_s),
+            "clock_ratio_applied": DEFS.VDAQ_TDT_CLOCK_RATIO,
         }
     return out
 

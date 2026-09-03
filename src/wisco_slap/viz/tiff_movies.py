@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import Iterator
+from collections.abc import Iterator
 
 import av
 import numpy as np
@@ -27,7 +27,6 @@ import tifffile
 import xarray as xr
 
 import slap2_py as spy
-
 import wisco_slap.defs as DEFS
 from wisco_slap.meta.get import ephys_offset as _get_ephys_offset
 from wisco_slap.meta.get import esum_mirror_path as _esum_mirror_path

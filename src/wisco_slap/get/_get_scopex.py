@@ -13,9 +13,10 @@ from collections.abc import Sequence
 import numpy as np
 import polars as pl
 import xarray as xr
-from slap2_py.core.xarr_summ import load_xr_from_zarr
 
+from slap2_py.core.xarr_summ import load_xr_from_zarr
 from wisco_slap.defs import anmat_root
+from wisco_slap.meta.get import clock_ratio as _get_clock_ratio
 from wisco_slap.meta.get import ephys_offset as _get_ephys_offset
 from wisco_slap.meta.get import sync_info as _get_sync_info
 
@@ -56,7 +57,7 @@ def _apply_ephys_offset(
 
     Single-epoch acqs and multi-epoch single-sync-block acqs: the shifted
     axis is "seconds from the TDT block's ephys_start" — the usual ephys
-    timebase. Straightforward.
+    timebase. Straightforward.a
 
     Multi-epoch cross-sync-block acqs: the offset we apply is epoch 1's
     (which is what ``sync_info.yaml`` stores by convention). The resulting
@@ -85,8 +86,17 @@ def _apply_ephys_offset(
             UserWarning,
             stacklevel=2,
         )
+    # The zarr time axis ticks on the microscope clock (SLAP2 FPGA == vDaq;
+    # see synchronization_validation/within_acq_shear_measurements.ipynb),
+    # which runs ~4 ppm slow relative to the TDT clock that ephys/pupil live
+    # on. Dividing by the acquisition's clock ratio (fleet constant, or the
+    # block's own pulse-measured value on rz_pulse-calibrated blocks) converts
+    # elapsed microscope-seconds to TDT seconds before anchoring at the
+    # (already-corrected) ephys_offset -- without it, traces drift ~4 us
+    # earlier per second into the acquisition (~16 ms/h).
+    ratio = _get_clock_ratio(subject, exp, loc, acq)
     return {
-        key: da.assign_coords(time=da.coords["time"].values + offset)
+        key: da.assign_coords(time=da.coords["time"].values / ratio + offset)
         for key, da in result.items()
     }
 
@@ -266,6 +276,7 @@ def roi_F(
     return_dFF: bool = False,
 ) -> dict[str, xr.DataArray]:
     """Load ROI (soma) fluorescence traces from scopex.
+    Note for the soma ROIs, channel=0 is jRGECO and channel=1 is iGluSnFR.
 
     Parameters
     ----------

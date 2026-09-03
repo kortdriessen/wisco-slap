@@ -149,16 +149,9 @@ def all_segments_in_state(
             }
         )
 
-    # Map each segment to the underlying hypnogram bout it lives in.
-    bout_starts = hypno.df["start_time"].to_numpy()
-    bout_ends = hypno.df["end_time"].to_numpy()
-    seg_starts = raw["start_time"].to_numpy()
-    bout_idx = []
-    for s in seg_starts:
-        idx = int(np.searchsorted(bout_starts, s, side="right") - 1)
-        if idx < 0 or idx >= len(bout_starts) or s > bout_ends[idx]:
-            idx = -1
-        bout_idx.append(idx)
+    # Map each segment to the underlying hypnogram bout it lives in (same
+    # half-open [start, end) rule as every other sample-to-bout lookup).
+    bout_idx = hypno.bout_index(raw["start_time"].to_numpy())
 
     out = (
         raw.with_columns(
@@ -244,7 +237,7 @@ def state_hypno_bouts(
         wall = float(e - s)
         wall_durs[k] = wall
         if dt > 0 and times.size:
-            in_window = (times >= s) & (times <= e)
+            in_window = (times >= s) & (times < e)  # half-open, like Hypnogram
             valid_durs[k] = float(valid[in_window].sum()) * dt
         else:
             valid_durs[k] = wall

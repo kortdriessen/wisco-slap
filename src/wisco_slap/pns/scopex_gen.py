@@ -8,8 +8,8 @@ import os
 import shutil
 
 import numpy as np
-import slap2_py as spy
 
+import slap2_py as spy
 import wisco_slap as wis
 from wisco_slap.defs import anmat_root
 

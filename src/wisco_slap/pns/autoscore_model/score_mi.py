@@ -1,10 +1,10 @@
 import os
 import pickle
 
-import electro_py as epy
 import numpy as np
 import yaml
 
+import electro_py as epy
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
 

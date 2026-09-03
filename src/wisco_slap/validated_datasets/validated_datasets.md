@@ -1,0 +1,1 @@
+Each file here contains a list which gives information about a set of data that I have personally validated as 'legit' data, ready to be included in summary, group-level analyses. If you are making a summary plot of some kind across subjects or experiments or cells, you almost certainly should be using one of these files.

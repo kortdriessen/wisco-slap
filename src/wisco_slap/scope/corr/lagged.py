@@ -32,7 +32,7 @@ from ... import get as _get
 from ...util.validity.mask import validity_mask
 from .aggregate import _r_to_z
 from .bouts import all_segments_in_state, fixed_valid_bouts, state_hypno_bouts
-from .core import _to_combined, _prep_combined
+from .core import _prep_combined, _to_combined
 from .state_compare import (
     _classify_pair,
     _coord_to_float_array,

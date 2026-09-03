@@ -201,7 +201,13 @@ def carve_bad(
     except Exception:
         pass
     del mv
-    mm.close()
+    try:
+        mm.close()
+    except BufferError:
+        # Some numpy views created by arr_at(copy=False) are still alive; the
+        # read-only mmap is released when they are garbage-collected. Do not
+        # throw away the carved data over it.
+        pass
 
     raw_e = np.concatenate(raw_e) if raw_e else np.array([], dtype=DT)
     raw_t = np.concatenate(raw_t) if raw_t else np.array([], dtype=DT)

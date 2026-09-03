@@ -20,12 +20,18 @@ of synapses.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal
 
 import bottleneck as bn
 import numpy as np
+import polars as pl
 import xarray as xr
 from scipy.signal import find_peaks
+
+MAD_TO_SIGMA: float = 1.4826  # median-abs-dev -> Gaussian sigma
 
 
 def compute_snr(
@@ -282,7 +288,7 @@ def _peak_amps_nan_safe(
         ends = np.concatenate((ends, [trace.size]))
 
     amps: list[np.ndarray] = []
-    for s, e in zip(starts, ends):
+    for s, e in zip(starts, ends, strict=True):
         seg = trace[s:e]
         if seg.size < 3:
             continue
@@ -301,6 +307,7 @@ def rolling_mad(
     center: bool = True,
     scale: bool = True,
     min_count: int | None = None,
+    lower_envelope: bool = False,
 ) -> xr.DataArray:
     """Centered rolling MAD via two passes of bottleneck.move_median.
 
@@ -310,41 +317,339 @@ def rolling_mad(
     NaN only where fewer than `min_count` real samples sit in the window
     (i.e. the center of a gap longer than ~window samples). Defaults to
     `max(1, window // 4)` — at least 25% of the window must be real.
+
+    Parameters
+    ----------
+    da
+        Input trace(s); any dims besides `dim` are broadcast over.
+    window
+        Window length in samples.
+    dim
+        Dimension to roll along.
+    center
+        Center the window on each sample (via NaN padding) rather than
+        trailing it.
+    scale
+        Multiply by 1.4826 so the MAD estimates Gaussian sigma.
+    min_count
+        Minimum real samples per window; below it the output is NaN.
+        Defaults to ``max(1, window // 4)``.
+    lower_envelope
+        If True, estimate scale from the *lower envelope* only: the
+        deviation pool keeps just the samples at/below the local rolling
+        median (``median - x`` where ``x <= median``), discarding all
+        above-median samples. For noise symmetric about baseline this is
+        statistically identical to the two-sided MAD (a deviation's
+        magnitude is independent of its sign), so the 1.4826 scaling
+        applies unchanged — but positive-only transients (glutamate /
+        calcium events) can never enter the lower deviation pool, so
+        event contamination only reaches the estimate indirectly, through
+        the median shift, instead of directly corrupting the deviations.
+        Use it on traces whose events are strictly positive and whose
+        baseline noise is symmetric: ``syn_dF-ls`` and matched-filter
+        output. Do NOT use it on rectified traces (``syn_dF-denoised``):
+        their below-median half hugs the zero floor and the estimate
+        collapses to ~0. Note both variants still inflate when sustained
+        activity drags the rolling median itself above baseline; for
+        synapses active most of the window, use the denoised-conditioned
+        :func:`lower_half_mad_sigma` in this module instead.
+        The deviation pass runs with ``min_count // 2`` (only ~half of
+        real samples yield a lower deviation), preserving `min_count`'s
+        "fraction of the window that must be real" meaning.
+
+    Notes
+    -----
+    Runs per-row on a thread pool (bottleneck's move_median releases the
+    GIL), so the two rolling-median passes parallelize across the non-time
+    dims (synapses / channels).
     """
     axis = da.get_axis_num(dim)
-    arr = np.ascontiguousarray(da.values)
+    arr = np.asarray(da.values)
+    if arr.dtype.kind != "f":
+        arr = arr.astype(np.float64)
     if min_count is None:
         min_count = max(1, window // 4)
+
+    moved = np.moveaxis(arr, axis, -1)
+    rows = np.ascontiguousarray(moved.reshape(-1, moved.shape[-1]))
+    out_rows = np.empty_like(rows)
+    dev_mc = max(1, min_count // 2) if lower_envelope else min_count
+    nanv = np.array(np.nan, dtype=rows.dtype)
 
     if center:
         pad_left = window // 2
         pad_right = window - 1 - pad_left
-        pads = [(0, 0)] * arr.ndim
-        pads[axis] = (pad_left, pad_right)
-        # Pad with NaN, not 'edge': edge mode replicates leading/trailing NaNs
-        # into a stripe across the padding. With min_count<window, NaN padding
-        # is simply ignored inside each window.
-        padded = np.pad(arr, pads, mode="constant", constant_values=np.nan)
-        sl = [slice(None)] * arr.ndim
-        sl[axis] = slice(window - 1, None)
-        sl = tuple(sl)
 
-        med = bn.move_median(padded, window=window, min_count=min_count, axis=axis)[sl]
-        abs_dev = np.abs(arr - med)
-        abs_dev_padded = np.pad(abs_dev, pads, mode="constant", constant_values=np.nan)
-        mad = bn.move_median(
-            abs_dev_padded, window=window, min_count=min_count, axis=axis
-        )[sl]
+        def _move_median(x: np.ndarray, mc: int) -> np.ndarray:
+            # Pad with NaN, not 'edge': edge mode replicates leading/trailing
+            # NaNs into a stripe across the padding. With min_count<window,
+            # NaN padding is simply ignored inside each window.
+            padded = np.pad(
+                x, (pad_left, pad_right), mode="constant", constant_values=np.nan
+            )
+            return bn.move_median(padded, window=window, min_count=mc)[window - 1 :]
+
     else:
-        med = bn.move_median(arr, window=window, min_count=min_count, axis=axis)
-        mad = bn.move_median(
-            np.abs(arr - med), window=window, min_count=min_count, axis=axis
-        )
+
+        def _move_median(x: np.ndarray, mc: int) -> np.ndarray:
+            return bn.move_median(x, window=window, min_count=mc)
+
+    def _one(i: int) -> None:
+        x = rows[i]
+        med = _move_median(x, min_count)
+        if lower_envelope:
+            dev = np.where(x <= med, med - x, nanv)
+        else:
+            dev = np.abs(x - med)
+        out_rows[i] = _move_median(dev, dev_mc)
+
+    _run_threaded(_one, rows.shape[0])
+    mad = np.moveaxis(out_rows.reshape(moved.shape), -1, axis)
 
     if scale:
-        mad = mad * 1.4826
+        mad = mad * MAD_TO_SIGMA
 
     return xr.DataArray(mad, dims=da.dims, coords=da.coords, name="mad")
+
+
+def _infer_fs(da: xr.DataArray, time_dim: str = "time") -> float:
+    """Sampling rate in Hz from the ``time`` coordinate (median spacing)."""
+    t = np.asarray(da.coords[time_dim].values, dtype=float)
+    dt = float(np.median(np.diff(t)))
+    if not np.isfinite(dt) or dt <= 0:
+        raise ValueError(f"Could not infer fs from '{time_dim}' coord.")
+    return 1.0 / dt
+
+
+def _odd_window(window_s: float, fs: float) -> int:
+    """Convert a window in seconds to an odd, >=3 sample count."""
+    w = max(3, int(round(window_s * fs)))
+    return w + 1 if w % 2 == 0 else w
+
+
+def _centered_move_median(
+    arr: np.ndarray, window: int, axis: int, min_count: int
+) -> np.ndarray:
+    """NaN-aware centered rolling median along ``axis`` (bottleneck-backed).
+
+    Same padding trick as :func:`rolling_mad`: NaN padding keeps the output
+    centered while NaNs are ignored within each window.
+    """
+    pad_left = window // 2
+    pad_right = window - 1 - pad_left
+    pads = [(0, 0)] * arr.ndim
+    pads[axis] = (pad_left, pad_right)
+    padded = np.pad(arr, pads, mode="constant", constant_values=np.nan)
+    sl = [slice(None)] * arr.ndim
+    sl[axis] = slice(window - 1, None)
+    return bn.move_median(padded, window=window, min_count=min_count, axis=axis)[
+        tuple(sl)
+    ]
+
+
+def _empty_like_reduced(
+    da: xr.DataArray, time_dim: str, name: str
+) -> tuple[np.ndarray, tuple[str, ...], dict]:
+    """Return a NaN array + dims/coords for a per-synapse (time-reduced) result."""
+    out_dims = tuple(d for d in da.dims if d != time_dim)
+    shape = tuple(da.sizes[d] for d in out_dims)
+    coords = {d: da.coords[d] for d in out_dims if d in da.coords}
+    return np.full(shape, np.nan, dtype=float), out_dims, coords
+
+
+def _as_float_rows(
+    da: xr.DataArray, time_dim: str
+) -> tuple[np.ndarray, tuple[int, ...]]:
+    """View/copy of ``da`` as a float (n_rows, n_time) array, time last.
+
+    Preserves float32 (no silent float64 upcast — halves memory traffic);
+    integer input is upcast to float64 so NaN masking works. Also returns the
+    time-last shape needed to reshape a per-sample result back.
+    """
+    x = np.asarray(da.values)
+    if x.dtype.kind != "f":
+        x = x.astype(np.float64)
+    axis = da.get_axis_num(time_dim)
+    moved = np.moveaxis(x, axis, -1)
+    return moved.reshape(-1, moved.shape[-1]), moved.shape
+
+
+def _run_threaded(fn: Callable[[int], None], n: int) -> None:
+    """Run ``fn(i)`` for i in range(n) on a thread pool.
+
+    Effective because the heavy per-row work (numpy partition-based
+    median/quantile, bottleneck move_median) releases the GIL.
+    """
+    workers = min(32, os.cpu_count() or 1, n)
+    if workers <= 1:
+        for i in range(n):
+            fn(i)
+        return
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(fn, range(n)))
+
+
+def _rolling_quantile(
+    x: np.ndarray, win: int, q: float, min_count: int, n_grid: int = 16
+) -> np.ndarray | None:
+    """Centered rolling quantile of ``x`` (NaN-aware), evaluated on a coarse
+    grid of ``win / n_grid`` steps and linearly interpolated to every sample.
+
+    Windows with fewer than ``min_count`` finite samples are skipped and
+    bridged by the interpolation; returns ``None`` when no window qualifies.
+    The threshold varies on the window timescale, so the coarse grid loses
+    nothing meaningful and keeps the cost negligible.
+    """
+    n = x.size
+    half = win // 2
+    step = max(1, win // n_grid)
+    centers = np.arange(0, n, step)
+    if centers[-1] != n - 1:
+        centers = np.append(centers, n - 1)
+    vals = np.full(centers.size, np.nan)
+    for k, c in enumerate(centers):
+        seg = x[max(0, c - half) : c + half + 1]
+        seg = seg[np.isfinite(seg)]
+        if seg.size >= min_count:
+            vals[k] = np.quantile(seg, q)
+    fin = np.isfinite(vals)
+    if not fin.any():
+        return None
+    return np.interp(np.arange(n), centers[fin], vals[fin]).astype(x.dtype)
+
+
+def lower_half_mad_sigma(
+    denoised: xr.DataArray,
+    ls: xr.DataArray,
+    baseline_quantile: float | None = 0.5,
+    window_s: float | None = None,
+    time_dim: str = "time",
+    scale: float = MAD_TO_SIGMA,
+    min_valid_frac: float = 0.25,
+) -> xr.DataArray:
+    """Baseline noise σ from the *lower half* of the ``ls`` trace.
+
+    The standard yardstick for expressing a denoised trace in noise units
+    (``denoised / sigma``): the denoised trace is a fit with the noise already
+    removed, so its scale must come from the ``ls`` data it was fitted to.
+
+    Two ideas combine here:
+
+    * **Lower half** — robust scale from only the samples at or below the
+      median, i.e. deviations that events (strictly positive) cannot create.
+      This is the one-sided alternative to a two-sided MAD; see
+      ``rolling_mad(lower_envelope=True)`` for the generic unconditioned
+      version.
+    * **Baseline conditioning** — first keep only samples whose *denoised*
+      level is in its lowest ``baseline_quantile`` fraction, so the median sits
+      at the true baseline center. Without this, a synapse that is active most
+      of the time has its ls median pulled far above baseline and the estimate
+      inflates badly (≈2× here). This is why ``denoised`` is needed, not just
+      ``ls``.
+
+    For symmetric baseline noise the lower-half MAD equals the ordinary MAD, so
+    the standard ``1.4826`` Gaussian calibration applies unchanged.
+
+    Parameters
+    ----------
+    denoised, ls : xr.DataArray
+        Denoised and LS traces (dims include ``time``). ``denoised`` selects
+        baseline samples; the σ is computed on ``ls``.
+    baseline_quantile : float or None
+        Keep samples with denoised level ≤ this per-synapse quantile before
+        estimating σ. ``0.5`` uses the quieter half. ``None`` disables
+        conditioning (pure one-sided scale of the whole ls trace — only sound
+        for synapses that are quiet most of the time).
+    window_s : float or None
+        ``None`` (default) -> one σ per synapse (a flat, stable noise floor,
+        ideal as a detection threshold). A number -> centered rolling estimate
+        of that length (seconds) to track slow baseline drift / bleaching.
+        Baseline conditioning is then LOCAL (the quantile of the denoised
+        level within each window), so windows always contribute their own
+        quiet half; returns per-sample σ (NaN only where a window has fewer
+        than ``min_valid_frac`` finite baseline samples, e.g. long NaN gaps).
+    scale : float
+        MAD→σ factor. ``1.4826`` calibrates to Gaussian σ.
+    min_valid_frac : float
+        Rolling mode: minimum fraction of a window that must be real baseline
+        samples, else NaN.
+
+    Returns
+    -------
+    xr.DataArray
+        ``window_s=None`` -> per-synapse σ (dims = input minus ``time``).
+        ``window_s`` set -> per-sample σ (same dims as input).
+
+    Notes
+    -----
+    Implementation is per-synapse and threaded (numpy's partition-based
+    median/quantile and bottleneck's move_median release the GIL), works on
+    compressed baseline samples instead of full-size NaN-masked copies, and
+    preserves float32 input without upcasting. Same estimator as the original
+    vectorized version to within float32 rounding.
+    """
+    xt, moved_shape = _as_float_rows(ls, time_dim)
+    dt = _as_float_rows(denoised, time_dim)[0]
+    n_rows = xt.shape[0]
+    conditioning = baseline_quantile is not None and baseline_quantile < 1.0
+    bq: float = float(baseline_quantile) if conditioning else 1.0
+
+    if window_s is None:
+        out_flat = np.full(n_rows, np.nan)
+
+        def _one(i: int) -> None:
+            xv, dv = xt[i], dt[i]
+            if conditioning:
+                dfin = dv[np.isfinite(dv)]
+                if dfin.size == 0:
+                    return
+                thr = np.quantile(dfin, bq)
+                sel = (dv <= thr) & np.isfinite(xv)
+            else:
+                sel = np.isfinite(xv)
+            xs = xv[sel]
+            if xs.size < 2:
+                return
+            med = np.median(xs)
+            out_flat[i] = scale * np.median(med - xs[xs <= med])
+
+        _run_threaded(_one, n_rows)
+        out, dims, coords = _empty_like_reduced(ls, time_dim, "sigma")
+        out[...] = out_flat.reshape(out.shape)
+        return xr.DataArray(out, dims=dims, coords=coords, name="sigma")
+
+    fs = _infer_fs(ls, time_dim)
+    win = _odd_window(window_s, fs)
+    med_mc = max(1, win // 8)
+    mad_mc = max(1, int(round(min_valid_frac * win / 4)))
+    nanv = np.array(np.nan, dtype=xt.dtype)
+    mad_rows = np.full_like(xt, np.nan)
+
+    def _one_roll(i: int) -> None:
+        xv, dv = xt[i], dt[i]
+        if conditioning:
+            # LOCAL baseline threshold: the quantile of the denoised level
+            # within each window, not of the whole recording. A global
+            # threshold starves windows where the denoised level sits above
+            # its recording-wide quantile for a long time (e.g. slow calcium
+            # early in a bleaching recording: <10% "quiet" samples -> NaN
+            # strips), even though the window has a perfectly good baseline.
+            thr = _rolling_quantile(dv, win, bq, min_count=med_mc)
+            if thr is None:
+                return
+            xb = np.where(dv <= thr, xv, nanv)
+        else:
+            xb = xv
+        med = _centered_move_median(xb, win, 0, min_count=med_mc)
+        lower = np.where(xb <= med, np.abs(xb - med), nanv)
+        mad_rows[i] = _centered_move_median(lower, win, 0, min_count=mad_mc)
+
+    _run_threaded(_one_roll, n_rows)
+    axis = ls.get_axis_num(time_dim)
+    mad = np.moveaxis(mad_rows.reshape(moved_shape), -1, axis)
+    return xr.DataArray(
+        scale * mad.astype(np.float64), dims=ls.dims, coords=ls.coords, name="sigma"
+    )
 
 
 def rolling_std(
@@ -429,9 +734,7 @@ def rolling_std(
             padded, window=window, min_count=min_count, axis=axis, ddof=ddof
         )[sl]
     else:
-        std = bn.move_std(
-            arr, window=window, min_count=min_count, axis=axis, ddof=ddof
-        )
+        std = bn.move_std(arr, window=window, min_count=min_count, axis=axis, ddof=ddof)
 
     out = xr.DataArray(std, dims=da.dims, coords=da.coords, name="std")
 
@@ -491,3 +794,53 @@ def _smooth_estimate(
         smoothed = move_fn(arr, window=window, min_count=min_count, axis=axis)
 
     return xr.DataArray(smoothed, dims=da.dims, coords=da.coords, name=da.name)
+
+
+def robust_minmax(df, df_filt, cols_to_normalize, qlower=1, qupper=99):
+    """Apply robust min-max normalization to specified columns in a DataFrame."""
+    normalized_df = df.clone()
+    for col in cols_to_normalize:
+        col_data = df_filt[col].to_numpy()
+        q1 = np.percentile(col_data, qlower)
+        q99 = np.percentile(col_data, qupper)
+        denom = q99 - q1
+        full_data = df[col].to_numpy()
+        norm_data = (full_data - q1) / denom
+        # clip to [0, 1]
+        norm_data = np.clip(norm_data, 0, 1)
+        normalized_df = normalized_df.with_columns(
+            pl.Series(name=f"{col}_norm", values=norm_data)
+        )
+    return normalized_df
+
+
+def min_max_dlc_dfs(eye_df, whisk_df):
+    eye_df = robust_minmax(
+        eye_df, eye_df.filter(pl.col("pup_likelihood") > 0.7), ["diameter", "motion"]
+    )
+    whisk_df = robust_minmax(whisk_df, whisk_df, ["whis"], qlower=1, qupper=99.9)
+    return eye_df, whisk_df
+
+
+def get_sigmas(matchfilt, denoised):
+    """
+    Compute SNRs for matched filter and denoised traces.
+    On matchfilt, we compute rolling_MAD, and on denoised we compute rolling_std.
+    """
+    mf_sigma = rolling_mad(matchfilt, window=(30 * 200))
+
+    dn_sigma = rolling_std(denoised, window=(300 * 200))
+
+    return mf_sigma, dn_sigma
+
+
+def get_snrs(matchfilt, denoised):
+    """
+    Compute SNRs for matched filter and denoised traces.
+    On matchfilt, we compute rolling_MAD, and on denoised we compute rolling_std.
+    """
+    mf_sigma = rolling_mad(matchfilt, window=(30 * 200))
+    mfsnr = matchfilt / mf_sigma
+    dn_sigma = rolling_std(denoised, window=(300 * 200))
+    dnsnr = denoised / dn_sigma
+    return mfsnr, dnsnr

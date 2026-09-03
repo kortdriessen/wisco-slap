@@ -15,16 +15,20 @@ import polars as pl
 from lightgbm import LGBMClassifier
 from sklearn.calibration import CalibratedClassifierCV
 
-from ._config import ScoreConfig, VIDEO_QUALITY_FEATURES
+from ._config import VIDEO_QUALITY_FEATURES, ScoreConfig
 from ._data import build_epoch_grid, intervals_to_epoch_labels, prepare_training_labels
-from ._features import add_context_features, build_features, extract_features_for_session
+from ._features import (
+    add_context_features,
+    build_features,
+    extract_features_for_session,
+)
 from ._hsmm import decode_session
 from ._utils import robust_scale_per_session
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_feature_cols(df: pl.DataFrame) -> list[str]:
     """Return the list of numeric feature columns (everything except metadata)."""

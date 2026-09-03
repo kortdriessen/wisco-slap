@@ -5,11 +5,12 @@ from . import meta as meta
 from . import peri as peri
 from . import pns as pns
 from . import scope as scope
+from . import spinelab as spinelab
 from . import util as util
 from . import viz as viz
 from .util import validity as validity  # surfaced at top level for convenience
 
 __all__ = [
     "core", "defs", "get", "peri", "util", "scope", "pns", "meta", "validity",
-    "viz",
+    "viz", "spinelab",
 ]

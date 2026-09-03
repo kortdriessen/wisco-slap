@@ -11,15 +11,35 @@ CLI: ``python -m wisco_slap.viz.synapto_anim [config.yaml]``.
 
 from .config import (
     AcquisitionConfig as AcquisitionConfig,
+)
+from .config import (
     AnimationConfig as AnimationConfig,
+)
+from .config import (
     CanvasConfig as CanvasConfig,
+)
+from .config import (
     OutputConfig as OutputConfig,
+)
+from .config import (
     OverlayKwargs as OverlayKwargs,
+)
+from .config import (
     Placement as Placement,
+)
+from .config import (
     ReferenceImage as ReferenceImage,
+)
+from .config import (
     SceneConfig as SceneConfig,
+)
+from .config import (
     TargetStrip as TargetStrip,
+)
+from .config import (
     load as load_config,
+)
+from .config import (
     save as save_config,
 )
 from .render import LandingInfo as LandingInfo

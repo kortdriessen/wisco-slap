@@ -6,8 +6,7 @@ import math
 
 import numpy as np
 
-from ._config import HSMMConfig, STATE_NAMES
-
+from ._config import STATE_NAMES, HSMMConfig
 
 # ---------------------------------------------------------------------------
 # Duration distribution

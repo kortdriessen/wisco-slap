@@ -3,10 +3,10 @@ import os
 import warnings
 from typing import Literal
 
-import electro_py as epy
 import numpy as np
 import polars as pl
 
+import electro_py as epy
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
 

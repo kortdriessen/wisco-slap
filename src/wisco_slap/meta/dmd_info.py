@@ -2,9 +2,9 @@
 # Meta File that this handles: dmd_info.yaml
 # ============================================
 import yaml
-from slap2_py.core.xsum import get_roi_list
 
 import wisco_slap.defs as DEFS
+from slap2_py.core.xsum import get_roi_list
 from wisco_slap.meta.get import esum_mirror_path
 
 

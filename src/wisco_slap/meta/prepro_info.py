@@ -6,12 +6,14 @@ import os
 
 import yaml
 
-from wisco_slap.defs import anmat_root, data_root
+from wisco_slap.defs import anmat_root, exsum_mirror_root, exsum_source_root
 from wisco_slap.meta.get import acq_master
 
 
 def determine_processing_done(subject, exp, loc, acq):
     """Determine if the processing has been done for a given acquisition.
+
+    Checks the ExperimentSummary source of truth (``defs.exsum_source_root``).
 
     Parameters
     ----------
@@ -24,7 +26,9 @@ def determine_processing_done(subject, exp, loc, acq):
     acq : str
         The acquisition ID.
     """
-    data_dir = os.path.join(data_root, subject, exp, loc, acq, "ExperimentSummary")
+    data_dir = os.path.join(
+        exsum_source_root, subject, exp, loc, acq, "ExperimentSummary"
+    )
     exp_summary_files = glob.glob(os.path.join(data_dir, "*Summary*"))
     if len(exp_summary_files) > 0:
         return exp_summary_files[0]
@@ -33,6 +37,13 @@ def determine_processing_done(subject, exp, loc, acq):
 
 
 def update_prepro_info_acqid(subject, exp, loc, acq, value=None):
+    """Record one acq's preprocessing version in ``prepro_info.yaml``.
+
+    With ``value=None`` the version is determined from the ExSum source of
+    truth; if the source has no ExSum but the mirror already holds one (an
+    acq awaiting reprocessing), the mirror's version is recorded instead of
+    ``"NO"`` — consistent with :func:`wis.meta.exsum_mirror.mirror_one_acq`.
+    """
     acq_id = f"{loc}--{acq}"
     prepro_path = os.path.join(anmat_root, "prepro_info.yaml")
     with open(prepro_path) as f:
@@ -45,6 +56,15 @@ def update_prepro_info_acqid(subject, exp, loc, acq, value=None):
         value = determine_processing_done(subject, exp, loc, acq)
         if value != "NO":
             value = os.path.basename(value).split(".mat")[0]
+        else:
+            mirror_dir = os.path.join(exsum_mirror_root, subject, exp, acq_id)
+            mirror_mats = (
+                [f for f in os.listdir(mirror_dir) if f.endswith(".mat")]
+                if os.path.isdir(mirror_dir)
+                else []
+            )
+            if mirror_mats:
+                value = mirror_mats[0].split(".mat")[0]
     prepro_info[subject][exp][acq_id] = value
     with open(prepro_path, "w") as f:
         yaml.dump(prepro_info, f)

@@ -1,7 +1,5 @@
 import os
 
-import wisco_slap.defs as DEFS
-
 
 def check_dir(dir_path: str) -> None:
     """Check if a directory exists, and create it if it doesn't.

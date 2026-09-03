@@ -3,14 +3,16 @@
 # ==================================================================================
 
 import csv
+import json
 import os
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import numpy as np
+import polars as pl
 import yaml
 
-from wisco_slap.defs import anmat_root, data_root, exsum_mirror_root
+from wisco_slap.defs import anmat_root, exsum_mirror_root, exsum_source_root
 
 
 # ==================================================================================
@@ -68,6 +70,23 @@ def ephys_offset(subject, exp, loc, acq):
             f"bypass alignment."
         )
     return offset
+
+
+def clock_ratio(subject, exp, loc, acq):
+    """The microscope-vs-TDT clock ratio to use for this acquisition.
+
+    Returns the per-acquisition ``clock_ratio_applied`` from
+    ``sync_info.yaml`` — the fleet constant for enable-rise-calibrated blocks,
+    or the block's own pulse-measured ratio for rz_pulse-calibrated blocks —
+    falling back to ``defs.VDAQ_TDT_CLOCK_RATIO`` for entries predating the
+    correction. Loaders divide microscope-clock time axes by this value to
+    express them in TDT seconds.
+    """
+    from wisco_slap.defs import VDAQ_TDT_CLOCK_RATIO
+
+    si = sync_info()
+    entry = si[subject][exp]["acquisitions"][f"{loc}--{acq}"]
+    return float(entry.get("clock_ratio_applied") or VDAQ_TDT_CLOCK_RATIO)
 
 
 def ephys_datetime(subject, exp, loc, acq):
@@ -149,7 +168,7 @@ def dmd_info():
     return dmd_info
 
 
-def soma_dmd(subject, exp, loc, acq, soma_id):
+def soma_dmd(subject, exp, loc, acq, soma_id, return_depth=False):
     """Get the DMD number (1 or 2) for a given soma ID.
 
     Parameters
@@ -164,6 +183,8 @@ def soma_dmd(subject, exp, loc, acq, soma_id):
         acquisition name
     soma_id : int or str
         soma ID to look up
+    return_depth : bool, optional
+        If True, also return the DMD's depth value (in microns) for this soma.
 
     Returns
     -------
@@ -184,6 +205,10 @@ def soma_dmd(subject, exp, loc, acq, soma_id):
     for dmd in ("dmd-1", "dmd-2"):
         dmd_somas = acq_info[dmd]["somas"]
         if soma_id in dmd_somas:
+            if return_depth:
+                return int(dmd[-1]), acq_info[dmd][
+                    "depth"
+                ]  # Extract the DMD number from the key
             return int(dmd[-1])  # Extract the DMD number from the key
 
 
@@ -232,37 +257,6 @@ def _audit_status_is_fresh(
     status_field: str,
 ) -> bool:
     return audit_row is not None and (audit_row.get(status_field) or "") == "fresh"
-
-
-def _events_exsum_is_complete(audit_row: dict[str, str] | None) -> bool:
-    """Match WISynaptic's rolled-up Events ExSum green/not-green semantics."""
-    if audit_row is None:
-        return False
-
-    matchfilt = (audit_row.get("events_matchfilt_status") or "").strip()
-    denoised = (audit_row.get("events_denoised_status") or "").strip()
-    if not matchfilt and not denoised:
-        return False
-
-    severity_order = {
-        "stale": 3,
-        "missing": 2,
-        "fresh": 1,
-        "not_applicable": 0,
-        "missing_mirror": 0,
-        "": 0,
-    }
-    severity = max(
-        severity_order.get(matchfilt, 0),
-        severity_order.get(denoised, 0),
-    )
-    rollup = "fresh"
-    for status in (matchfilt, denoised):
-        if severity_order.get(status, 0) == severity and status:
-            rollup = status
-            break
-
-    return rollup == "fresh"
 
 
 def _audit_scoring_is_complete(audit_row: dict[str, str] | None) -> bool:
@@ -390,7 +384,6 @@ def valid_acquisitions(
     critical checklist currently corresponds to:
 
     - Scopex ExSum
-    - Events ExSum
     - Annotation ExSum
     - Scoring Complete
     - Label Completeness
@@ -449,7 +442,6 @@ def valid_acquisitions(
                 sb_dir = _sync_block_dir(subject, exp, sync_block)
                 if all((
                     _audit_status_is_fresh(audit_row, "scopex_status"),
-                    _events_exsum_is_complete(audit_row),
                     _audit_status_is_fresh(audit_row, "annotation_status"),
                     _audit_scoring_is_complete(audit_row),
                     _label_completeness_is_complete(annotation_dir),
@@ -677,7 +669,12 @@ def acq_timing(subject: str, exp: str, loc: str, acq: str) -> AcqTiming:
 
 
 def esum_path_raw(subject: str, exp: str, loc: str, acq: str) -> str | None:
-    """Get path to summary data for a given recording.
+    """Get path to the source-of-truth ExperimentSummary for a recording.
+
+    Reads from ``defs.exsum_source_root`` (currently the local raw_mirror
+    during the channel-fix reprocessing reintegration; normally the NAS
+    ``data_root``). Returns None when the source has no ExSum yet — e.g. an
+    acquisition awaiting reprocessing.
 
     Parameters
     ----------
@@ -690,7 +687,9 @@ def esum_path_raw(subject: str, exp: str, loc: str, acq: str) -> str | None:
     acq : str
         acquisition name
     """
-    esum_dir = os.path.join(data_root, subject, exp, loc, acq, "ExperimentSummary")
+    esum_dir = os.path.join(
+        exsum_source_root, subject, exp, loc, acq, "ExperimentSummary"
+    )
     if not os.path.exists(esum_dir):
         return None
     # Should only be one file inside this folder
@@ -701,3 +700,83 @@ def esum_path_raw(subject: str, exp: str, loc: str, acq: str) -> str | None:
         return os.path.join(esum_dir, esum_files[0])
     else:
         raise ValueError(f"Multiple esum files found for {subject} {exp} {loc} {acq}")
+
+
+# ==================================================================================
+# 9. Acquisition classifications (WISynaptic "Classify" tool)
+# ==================================================================================
+def _classifications_dir() -> Path:
+    return Path(anmat_root) / "annotation_materials" / "_CLASSIFICATIONS"
+
+
+def classification_names() -> list[str]:
+    """Names of all saved acquisition classifications, sorted.
+
+    Classifications are created and labeled in WISynaptic via the "Classify"
+    toolbar button; each is one JSON file in
+    ``annotation_materials/_CLASSIFICATIONS/``.
+    """
+    cdir = _classifications_dir()
+    if not cdir.is_dir():
+        return []
+    return sorted(p.stem for p in cdir.glob("*.json"))
+
+
+def _load_classification_json(name: str) -> dict:
+    """Read one classification's raw JSON, with a helpful error if absent."""
+    path = _classifications_dir() / f"{name}.json"
+    if not path.is_file():
+        available = classification_names()
+        raise FileNotFoundError(
+            f"No classification named '{name}' at {path}. "
+            f"Available: {available}"
+        )
+    with open(path) as f:
+        return json.load(f)
+
+
+def classification_values(name: str) -> list[str]:
+    """Declared value scheme for one classification, in declaration order.
+
+    Parameters
+    ----------
+    name : str
+        Classification name, e.g. ``"sleep_condition"`` (see
+        :func:`classification_names`).
+
+    Returns
+    -------
+    list[str]
+        The values an acquisition may be labeled with, e.g.
+        ``["sd_early", "sleep_early", "sd_late", "sleep_late"]``. Does not
+        include ``"NO_VALUE"``, the placeholder recorded for acquisitions
+        that have been seen but not yet labeled.
+    """
+    return [entry["value"] for entry in _load_classification_json(name)["values"]]
+
+
+def classification(name: str) -> pl.DataFrame:
+    """Load one acquisition classification as a tidy dataframe.
+
+    Parameters
+    ----------
+    name : str
+        Classification name, e.g. ``"sleep_condition"`` (see
+        :func:`classification_names`).
+
+    Returns
+    -------
+    pl.DataFrame
+        One row per acquisition with columns ``subject``, ``exp``, ``loc``,
+        ``acq``, ``value``. A value of ``"NO_VALUE"`` means the acquisition
+        has not been labeled yet.
+    """
+    data = _load_classification_json(name)
+    schema = {
+        "subject": pl.String,
+        "exp": pl.String,
+        "loc": pl.String,
+        "acq": pl.String,
+        "value": pl.String,
+    }
+    return pl.DataFrame(data["labels"], schema=schema)

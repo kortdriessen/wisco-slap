@@ -21,6 +21,12 @@ Public API:
 - :func:`valid_duration_per_state` — per-state valid duration.
 - :func:`event_rate_per_state` — NaN-aware event rate per state.
 
+This module holds the NaN-aware *primitives* only. Event-rate **analysis** —
+per-synapse rates computed from a ``master_event_detector`` ``peaks_df``, by
+state / bout / rolling window / fraction / fixed-duration epoch — lives in
+:mod:`wisco_slap.scope.rates` (``wis.scope.rates.compute_rate*``), alongside
+its correlation counterpart :mod:`wisco_slap.scope.corr`.
+
 Default policy: when collapsing a 2-D ``(syn_id, time)`` array to a 1-D
 validity mask, a timepoint is considered valid only if **every** synapse is
 non-NaN (``mode='all'``). Override with ``mode='any'`` or ``mode='per_syn'``.
@@ -39,18 +45,32 @@ from __future__ import annotations
 
 from .events import (
     event_rate_per_state as event_rate_per_state,
+)
+from .events import (
     valid_duration_per_state as valid_duration_per_state,
 )
 from .hypno import (
     add_valid_duration as add_valid_duration,
+)
+from .hypno import (
     valid_state_epochs as valid_state_epochs,
+)
+from .hypno import (
     valid_state_intervals as valid_state_intervals,
 )
 from .mask import (
     attach_validity as attach_validity,
+)
+from .mask import (
     resolve_mask as resolve_mask,
+)
+from .mask import (
     valid_duration as valid_duration,
+)
+from .mask import (
     validity_intervals as validity_intervals,
+)
+from .mask import (
     validity_mask as validity_mask,
 )
 

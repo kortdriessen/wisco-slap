@@ -86,6 +86,68 @@ def _check_whisk_df(subject: str, exp: str, sb: int) -> bool:
     return os.path.isfile(path)
 
 
+def _sync_blocks_with_acqs(subject: str, exp: str) -> set[int]:
+    """Sync blocks that cover at least one acquisition (from sync_info.yaml)."""
+    si = wis.meta.get.sync_info()
+    acqs = si[subject][exp].get("acquisitions", {}) or {}
+    return {int(entry["sync_block"]) for entry in acqs.values()}
+
+
+def _borrowable_whisk_mask(subject: str, exp: str, sb: int) -> str | None:
+    """Path of another sync block's ``mask.tif`` that block ``sb`` may reuse.
+
+    The whisker mask is hand-drawn per sync block, but a block that holds
+    no SLAP2 acquisition (e.g. a block recorded only to extend sleep
+    scoring) is not worth a manual pass: the camera never moves within an
+    experiment, so a mask from a sibling block is as good as its own. The
+    rule is deliberately narrow — borrowing happens only when ALL of:
+
+    - ``sb`` has no ``mask.tif`` of its own;
+    - ``sb`` covers no acquisition in ``sync_info.yaml``;
+    - some other block in the same experiment covers >= 1 acquisition AND
+      has a ``mask.tif``.
+
+    Among eligible donors the nearest block number wins (ties go to the
+    earlier block). Returns ``None`` when the rule does not apply.
+    """
+    if _check_whisk_mask(subject, exp, sb):
+        return None
+    with_acqs = _sync_blocks_with_acqs(subject, exp)
+    if int(sb) in with_acqs:
+        return None
+    donors = [
+        d for d in with_acqs if d != int(sb) and _check_whisk_mask(subject, exp, d)
+    ]
+    if not donors:
+        return None
+    donor = min(donors, key=lambda d: (abs(d - int(sb)), d))
+    return os.path.join(_sb_dir(subject, exp, donor), "whisking", "mask.tif")
+
+
+def _borrow_whisk_mask(subject: str, exp: str, sb: int, donor_mask: str) -> str:
+    """Copy ``donor_mask`` into block ``sb``'s whisking dir, with provenance.
+
+    Writes ``whisking/mask.tif`` (so every downstream check and loader sees
+    an ordinary mask) plus ``whisking/mask_source.txt`` recording which
+    block it came from. Returns the new mask path.
+    """
+    import shutil
+
+    whisk_dir = os.path.join(_sb_dir(subject, exp, sb), "whisking")
+    os.makedirs(whisk_dir, exist_ok=True)
+    target = os.path.join(whisk_dir, "mask.tif")
+    shutil.copy2(donor_mask, target)
+    with open(os.path.join(whisk_dir, "mask_source.txt"), "w", encoding="utf-8") as f:
+        f.write(
+            "mask.tif was not hand-drawn for this sync block (it covers no "
+            "acquisition); copied from\n"
+            f"{donor_mask}\n"
+            "by wisco_slap.pns.sync_block_mon._borrow_whisk_mask. Draw and save "
+            "a real mask here to replace it.\n"
+        )
+    return target
+
+
 # ---------------------------------------------------------------------------
 # Orchestrators
 # ---------------------------------------------------------------------------
@@ -144,10 +206,20 @@ def sb_data(subject: str, exp: str, sb: int, overwrite: bool = False) -> None:
         print(f"[{tag}] Saving video frame stack...")
         sync_block_dat.save_video_frame_stack(subject, exp, sb)
 
-    # 6. Whisk df (depends on frame_times + mask)
+    # 6. Whisk df (depends on frame_times + mask). A block with no
+    #    acquisitions may borrow a sibling block's hand-drawn mask.
     if overwrite or not _check_whisk_df(subject, exp, sb):
         has_frame_times = _check_frame_times(subject, exp, sb)
         has_mask = _check_whisk_mask(subject, exp, sb)
+        if not has_mask:
+            donor_mask = _borrowable_whisk_mask(subject, exp, sb)
+            if donor_mask is not None:
+                print(
+                    f"[{tag}] No mask.tif and no acquisitions in this block — "
+                    f"borrowing whisker mask from {donor_mask}"
+                )
+                _borrow_whisk_mask(subject, exp, sb, donor_mask)
+                has_mask = True
         if has_frame_times and has_mask:
             print(f"[{tag}] Saving whisking frame differences...")
             sync_block_dat.save_whisking_frame_differences(subject, exp, sb)

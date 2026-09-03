@@ -11,19 +11,23 @@ reference image. Two coloring modes are supported:
   shade within and between synapses.
 * ``color_by_pos=True`` — each synapse is given a single flat color whose
   position in ``cmap`` reflects its proximal-to-distal index along its
-  dendrite (``pos`` from the scopex coords), normalized to ``[0, 1]``
-  per dendrite. With ``cmap='summer'`` this gives the most-proximal
-  synapse on each dendrite the same green and the most-distal the same
-  yellow, regardless of dendrite length.
+  dendrite (``pos`` from the prox-line ordering in the annotation labels),
+  normalized to ``[0, 1]`` per dendrite. With ``cmap='summer'`` this gives
+  the most-proximal synapse on each dendrite the same green and the
+  most-distal the same yellow, regardless of dendrite length.
+
+The synapse selection (which sources to color, and their ``pos`` /
+``dend-ID`` / ``soma-ID``) is read from ``wis.get.synid_labels`` — no raw
+scopex traces are loaded.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
+import polars as pl
 import xarray as xr
 from matplotlib.axes import Axes
 from matplotlib.colors import LogNorm
@@ -31,11 +35,11 @@ from matplotlib.figure import Figure
 
 import slap2_py as spy
 
-from wisco_slap.get import syn_dF
-from wisco_slap.meta.get import esum_mirror_path
-
-# Bring the ``.sx`` xarray accessor into scope.
+# Bring the ``.sx`` xarray accessor into scope (used by ``_select_synapses``,
+# which is imported by the synapto-animation renderer).
 from wisco_slap.core import ScopeX_class  # noqa: F401
+from wisco_slap.get import synid_labels
+from wisco_slap.meta.get import esum_mirror_path
 
 
 def _mask_fpvals_to_valid(
@@ -114,6 +118,52 @@ def _select_synapses(
     return da
 
 
+def _select_syn_labels(
+    idf: pl.DataFrame | None,
+    dmd: int,
+    soma: str | None,
+    require_dend: bool,
+) -> pl.DataFrame | None:
+    """Select this DMD's synapses from the annotation-label table.
+
+    This is the annotation-only equivalent of :func:`_select_synapses` — it
+    reproduces the same soma / dendrite filtering, but works purely from
+    :func:`wisco_slap.get.synid_labels` so no raw scopex traces need to be
+    loaded just to know which sources to color. That the two are equivalent
+    is not a coincidence: the ``dend-ID`` / ``soma-ID`` / ``pos`` coords that
+    ``_select_synapses`` filters on are themselves left-joined onto the scopex
+    array from ``synid_labels`` at load time.
+
+    Parameters
+    ----------
+    idf : pl.DataFrame or None
+        The full-acquisition label table from ``synid_labels``, or ``None``
+        when no ``synapse_labels.csv`` exists (in which case there is nothing
+        to overlay).
+    dmd : int
+        DMD number (1 or 2).
+    soma : str or None
+        If given, restrict to synapses on this soma. ``None`` keeps all somas.
+    require_dend : bool
+        If True, drop synapses with no dendrite assignment.
+
+    Returns
+    -------
+    pl.DataFrame or None
+        Filtered table (sorted by ``syn_id``), with columns including
+        ``syn_id``, ``dend-ID`` and — when prox-line ordering exists for the
+        acquisition — ``pos``. ``None`` when ``idf`` is ``None``.
+    """
+    if idf is None:
+        return None
+    df = idf.filter(pl.col("dmd") == dmd)
+    if soma is not None:
+        df = df.filter(pl.col("soma-ID") == soma)
+    if require_dend:
+        df = df.filter(pl.col("dend-ID").is_not_null())
+    return df.sort("syn_id")
+
+
 def _crop_bbox(img: np.ndarray, buf: int) -> tuple[int, int, int, int]:
     """Return ``(rmin, rmax, cmin, cmax)`` for the non-NaN bbox of ``img``, padded by ``buf``."""
     valid = ~np.isnan(img)
@@ -169,8 +219,6 @@ def plot_synapto_overlays(
     *,
     color_by_pos: bool = False,
     soma: str | None = None,
-    channel: int | None = 0,
-    trace: Literal["denoised", "ls"] = "denoised",
     require_dend: bool = True,
     cmap: str = "summer",
     mean_im_channel: int = 1,
@@ -200,12 +248,7 @@ def plot_synapto_overlays(
         color pixels by raw ``fpvals`` through ``cmap`` (standard overlay).
     soma : str | None
         If given, restrict synapses to this soma (``'soma1'`` etc.). Default
-        ``None`` includes all somas present in the scopex zarr.
-    channel : int | None
-        Scopex channel to select. Default 0 (iGluSnFR). Use ``None`` to skip
-        channel selection.
-    trace : ``'denoised'`` | ``'ls'``
-        Which scopex synaptic-dF zarr to read coords from.
+        ``None`` includes all somas present in the label table.
     require_dend : bool
         If True (default), drop synapses with no dendrite assignment. Always
         forced True when ``color_by_pos=True`` (``pos`` requires a dendrite).
@@ -262,7 +305,9 @@ def plot_synapto_overlays(
     esum_p = esum_mirror_path(subject, exp, loc, acq)
     mim = spy.xsum.get_meanIM(esum_p)
     smap_all, fpvals_all = spy.xsum.get_fp_info(esum_p, threshold=fp_threshold)
-    dn = syn_dF(subject, exp, loc, acq, trace=trace, channels=[channel] if channel is not None else None)
+    # Which sources to color comes entirely from the annotation labels — no
+    # raw traces needed. ``None`` when the acq has no synapse_labels.csv yet.
+    idf = synid_labels(subject, exp, loc, acq)
 
     out: dict[str, tuple[Figure, Axes]] = {}
     for dmd in (1, 2):
@@ -275,24 +320,29 @@ def plot_synapto_overlays(
         f, ax = plt.subplots(1, 1, figsize=figsize)
         ax.imshow(img, norm=LogNorm(vmin=log_vmin, vmax=vmax), cmap="gray")
 
-        # Build overlay, if there is a scopex selection for this DMD
+        # Build overlay, if there is a synapse selection for this DMD
         n_sources = 0
-        if key in dn:
-            da = _select_synapses(dn[key], channel, soma, require_dend)
-            if da.sizes.get("syn_id", 0) > 0:
-                syn_ids = np.asarray(da.syn_id.values, dtype=int)
-                n_sources = int(syn_ids.size)
-                smap = smap_all[dmd]
-                if color_by_pos:
-                    poses = np.asarray(da["pos"].values, dtype=float)
-                    dend_ids = np.asarray(da["dend-ID"].values)
-                    norm_pos = _normalize_pos_per_dendrite(poses, dend_ids)
-                    overlay = _build_pos_overlay(smap, syn_ids, norm_pos, cmap)
-                    ax.imshow(overlay)
-                else:
-                    fpv = fpvals_all[dmd][:]
-                    fpv = _mask_fpvals_to_valid(fpv, smap, syn_ids)
-                    ax.imshow(fpv, cmap=cmap, alpha=overlay_alpha)
+        sel = _select_syn_labels(idf, dmd, soma, require_dend)
+        if sel is not None and sel.height > 0:
+            syn_ids = sel["syn_id"].to_numpy().astype(int)
+            n_sources = int(syn_ids.size)
+            smap = smap_all[dmd]
+            if color_by_pos:
+                if "pos" not in sel.columns:
+                    raise KeyError(
+                        "color_by_pos=True needs proximal-to-distal ordering, "
+                        f"but no 'pos' data exists for {subject}/{exp}/{loc}/"
+                        f"{acq} (dmd {dmd}). Draw prox lines in WISynaptic first."
+                    )
+                poses = sel["pos"].to_numpy().astype(float)
+                dend_ids = sel["dend-ID"].to_numpy()
+                norm_pos = _normalize_pos_per_dendrite(poses, dend_ids)
+                overlay = _build_pos_overlay(smap, syn_ids, norm_pos, cmap)
+                ax.imshow(overlay)
+            else:
+                fpv = fpvals_all[dmd][:]
+                fpv = _mask_fpvals_to_valid(fpv, smap, syn_ids)
+                ax.imshow(fpv, cmap=cmap, alpha=overlay_alpha)
 
         # Crop and frame
         rmin, rmax, cmin, cmax = _crop_bbox(img, crop_buf_px)

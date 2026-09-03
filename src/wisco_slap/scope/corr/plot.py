@@ -8,7 +8,8 @@ correlation tables produced by :mod:`wisco_slap.scope.corr.state_compare`.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Union
 
 import matplotlib.pyplot as plt
@@ -59,84 +60,73 @@ def _safe_str(v) -> str:
 # ---------------------------------------------------------------------------
 
 
-def plot_slap2_corr_matrix(
+@dataclass
+class CorrMatrixOrder:
+    """Row/column order of a correlation matrix and its grouping blocks.
+
+    Produced by :func:`corr_matrix_order`; consumed by
+    :func:`plot_slap2_corr_matrix`. Blocks are ``(key, first_row, last_row)``
+    tuples in plotted order (rows are inclusive).
+    """
+
+    order_idx: list[int]
+    dend_blocks: list[tuple]
+    middle_blocks: list[tuple]
+    soma_blocks: list[tuple]
+    middle_name: str
+    dmd_depth: dict[int, float]
+    soma_depth: dict[str, float]
+
+    @property
+    def n(self) -> int:
+        return len(self.order_idx)
+
+
+def _depth_lookup(corr: xr.DataArray, coord: str, keys: np.ndarray) -> dict:
+    """``{key: depth}`` from a mirrored ``<coord>_1`` coord, dropping NaNs."""
+    if coord not in corr.coords:
+        return {}
+    vals = np.asarray(corr.coords[coord].values)
+    out: dict = {}
+    for k, v in zip(keys, vals, strict=True):
+        try:
+            d = float(v)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(d):
+            out.setdefault(k, d)
+    return out
+
+
+def corr_matrix_order(
     corr: xr.DataArray,
+    *,
     DMD_first: int = 1,
-    cmap: str = "RdBu_r",
-    vmin: float = -1.0,
-    vmax: float = 1.0,
-    boundary_color: str = "0.4",
-    boundary_lw: float = 0.6,
-    boundary_alpha: float = 1.0,
-    dend_labels: LabelOpt = "auto",
-    dmd_labels: LabelOpt = "auto",
-    soma_labels: LabelOpt = "auto",
-    cbar_label: str | None = "Pearson r",
-    figsize: tuple[float, float] | None = None,
-    ax: plt.Axes | None = None,
-    bracket_color: str = "0.15",
-    bracket_lw: float = 1.4,
-    label_fontsize: float = 8.5,
-    show_x_brackets: bool = True,
-    show_y_brackets: bool = True,
+    dmd_order: str | Sequence[int] = "DMD_first",
     group_by_soma: bool = False,
-    soma_color: str | None = None,
-    dend_type_colors: Mapping[str, str] | None = None,
-    naked_matrix: bool = False,
-):
-    """Plot a synapse-by-synapse correlation matrix.
-
-    Rows and columns are ordered identically. Tree-style brackets mark the
-    dendrite, middle (DMD or dend_type), and soma blocks on the left axis;
-    matching brackets are drawn below the bottom axis. Each `*_labels` argument
-    controls only the text on its level (`'auto'` / dict / `False`-or-`'off'`).
-
-    Two ordering modes:
-      - `group_by_soma=False` (default): DMD `DMD_first` first, then soma,
-        then dendrite, then `pos`. A soma that appears on both DMDs shows up
-        as two separate soma blocks (one inside each DMD block). Middle level
-        is DMD.
-      - `group_by_soma=True`: soma first, then dend_type (alphabetical, e.g.
-        Apical → Basal) if a `dend_type` coord is present, otherwise DMD
-        (`DMD_first` first within each soma), then dendrite, then `pos`. All
-        dendrites belonging to a given soma are contiguous. Soma labels are
-        coloured red and dend_type labels are colour-coded by default
-        (Apical = orange, Basal = blue) to give the level a quick visual key.
+) -> CorrMatrixOrder:
+    """Sort a synapse-by-synapse matrix into DMD / soma / dendrite / ``pos`` blocks.
 
     Parameters
     ----------
-    corr : xr.DataArray
-        Output of `pairwise_pearson_corr`, with dims ('syn_1', 'syn_2') and the
-        usual scopex coords mirrored on both dims as `<name>_1` / `<name>_2`.
-    DMD_first : int
-        Which DMD (1 or 2) is plotted first within its grouping level.
-    group_by_soma : bool
-        If True, group synapses by soma first (see above).
-    soma_color : str | None
-        Colour for the soma-level brackets and labels. None → red when
-        `group_by_soma`, otherwise `bracket_color`.
-    dend_type_colors : Mapping[str, str] | None
-        Mapping from `dend_type` value → colour for the middle-level brackets
-        and labels (only consulted when the middle level is `dend_type`). None
-        → `{"Apical"/"apical": orange, "Basal"/"basal": blue}` when
-        `group_by_soma`, otherwise empty (all middle-level brackets use
-        `bracket_color`).
-    naked_matrix : bool
-        If True, plot only the matrix and the internal dendrite-division
-        lines — no colour bar, no brackets, no labels, no axis decorations.
-        Overrides `cbar_label`, `show_x_brackets`, and `show_y_brackets`.
+    corr
+        ``(syn_1, syn_2)`` DataArray with the scopex coords mirrored as
+        ``<name>_1`` / ``<name>_2`` (``dmd_1`` required; ``soma-ID_1``,
+        ``dend-ID_1``, ``pos_1``, ``dend_type_1``, ``dmd-depth_1``,
+        ``soma-depth_1`` optional).
+    DMD_first
+        Which DMD leads when ``dmd_order == "DMD_first"``.
+    dmd_order
+        ``"DMD_first"`` (legacy: ``DMD_first`` first, then the rest by
+        number), ``"depth"`` (ascending ``dmd-depth_1`` — the most
+        superficial DMD at the top; ties / missing depth fall back to the
+        DMD number; without a depth coord this equals ``"DMD_first"``), or
+        an explicit sequence of DMD numbers.
+    group_by_soma
+        Group by soma first (then ``dend_type`` if present, else DMD), so all
+        dendrites of a soma are contiguous. See :func:`plot_slap2_corr_matrix`.
     """
-    if naked_matrix:
-        cbar_label = None
-        show_x_brackets = False
-        show_y_brackets = False
-    if "syn_1" not in corr.dims or "syn_2" not in corr.dims:
-        raise ValueError("`corr` must have dims ('syn_1', 'syn_2').")
     n = corr.sizes["syn_1"]
-    if n == 0:
-        raise ValueError("Empty correlation matrix.")
-    if corr.sizes["syn_2"] != n:
-        raise ValueError("Correlation matrix is not square.")
 
     def _coord(name):
         return corr.coords[name].values if name in corr.coords else None
@@ -174,28 +164,27 @@ def plot_slap2_corr_matrix(
         has_dend_type = False
     use_dend_type_middle = group_by_soma and has_dend_type
 
-    if group_by_soma:
-        eff_soma_color = soma_color if soma_color is not None else "tab:red"
-        eff_dend_type_colors: Mapping[str, str] = (
-            dend_type_colors
-            if dend_type_colors is not None
-            else {
-                "Apical": "tab:orange",
-                "apical": "tab:orange",
-                "Basal": "tab:blue",
-                "basal": "tab:blue",
-            }
-        )
-    else:
-        eff_soma_color = soma_color if soma_color is not None else bracket_color
-        eff_dend_type_colors = dend_type_colors if dend_type_colors is not None else {}
+    dmd_depth = _depth_lookup(corr, "dmd-depth_1", dmds)
+    soma_depth = _depth_lookup(corr, "soma-depth_1", somas)
 
     unique_dmds = sorted(set(dmds.tolist()))
-    if DMD_first in unique_dmds:
-        dmd_order = [DMD_first] + [d for d in unique_dmds if d != DMD_first]
+    if isinstance(dmd_order, str):
+        if dmd_order == "depth" and dmd_depth:
+            dmd_seq = sorted(unique_dmds, key=lambda d: (dmd_depth.get(d, np.inf), d))
+        elif dmd_order in ("depth", "DMD_first"):
+            if DMD_first in unique_dmds:
+                dmd_seq = [DMD_first] + [d for d in unique_dmds if d != DMD_first]
+            else:
+                dmd_seq = unique_dmds
+        else:
+            raise ValueError(
+                f"dmd_order must be 'DMD_first', 'depth' or a sequence of DMD "
+                f"numbers, got {dmd_order!r}"
+            )
     else:
-        dmd_order = unique_dmds
-    dmd_rank = {d: i for i, d in enumerate(dmd_order)}
+        dmd_seq = [int(d) for d in dmd_order]
+        dmd_seq += [d for d in unique_dmds if d not in dmd_seq]
+    dmd_rank = {d: i for i, d in enumerate(dmd_seq)}
 
     if group_by_soma:
         middle_for_sort: list = (
@@ -225,7 +214,6 @@ def plot_slap2_corr_matrix(
     sort_tuples.sort()
     order_idx = [t[-1] for t in sort_tuples]
 
-    M = corr.isel(syn_1=order_idx, syn_2=order_idx).values
     dmds = dmds[order_idx]
     somas = somas[order_idx]
     dends = dends[order_idx]
@@ -273,6 +261,175 @@ def plot_slap2_corr_matrix(
     soma_blocks.append((somas[n - 1], soma_start, n - 1))
     middle_blocks.append((_mid_label(n - 1), mid_start, n - 1))
 
+    return CorrMatrixOrder(
+        order_idx=order_idx,
+        dend_blocks=dend_blocks,
+        middle_blocks=middle_blocks,
+        soma_blocks=soma_blocks,
+        middle_name="dend_type" if use_dend_type_middle else "dmd",
+        dmd_depth=dmd_depth,
+        soma_depth=soma_depth,
+    )
+
+
+def _with_depth_labels(opt: LabelOpt, depths: Mapping, fmt) -> LabelOpt:
+    """Turn ``'auto'`` into an explicit label mapping carrying depths, if known."""
+    if isinstance(opt, str) and opt == "auto" and depths:
+        return {k: fmt(k, d) for k, d in depths.items()}
+    return opt
+
+
+def plot_slap2_corr_matrix(
+    corr: xr.DataArray,
+    DMD_first: int = 1,
+    cmap="RdBu_r",
+    vmin: float = -1.0,
+    vmax: float = 1.0,
+    boundary_color: str = "0.4",
+    boundary_lw: float = 0.6,
+    boundary_alpha: float = 1.0,
+    dend_labels: LabelOpt = "auto",
+    dmd_labels: LabelOpt = "auto",
+    soma_labels: LabelOpt = "auto",
+    cbar_label: str | None = "Pearson r",
+    figsize: tuple[float, float] | None = None,
+    ax: plt.Axes | None = None,
+    bracket_color: str = "0.15",
+    bracket_lw: float = 1.4,
+    label_fontsize: float = 8.5,
+    show_x_brackets: bool = True,
+    show_y_brackets: bool = True,
+    group_by_soma: bool = False,
+    soma_color: str | None = None,
+    dend_type_colors: Mapping[str, str] | None = None,
+    naked_matrix: bool = False,
+    dmd_order: str | Sequence[int] = "DMD_first",
+    dmd_boundary_lw: float | None = None,
+    mask_diagonal: bool = False,
+    nan_color: str | None = None,
+    dend_brackets: bool = True,
+    dmd_brackets: bool = True,
+    soma_brackets: bool = True,
+    label_rotation: Mapping[str, float] | None = None,
+):
+    """Plot a synapse-by-synapse correlation matrix.
+
+    Rows and columns are ordered identically (see :func:`corr_matrix_order`).
+    Tree-style brackets mark the dendrite, middle (DMD or dend_type), and
+    soma blocks on the left axis; matching brackets are drawn below the
+    bottom axis. Each `*_labels` argument controls only the text on its
+    level (`'auto'` / dict / `False`-or-`'off'`). With `'auto'`, DMD and
+    soma labels carry the depth (``"DMD 2\\n160 µm"``, ``"soma1\\n235 µm"``)
+    whenever the matrix has ``dmd-depth_1`` / ``soma-depth_1`` coords.
+
+    Two ordering modes:
+      - `group_by_soma=False` (default): DMD blocks (ordered by `dmd_order`),
+        then soma, then dendrite, then `pos`. A soma that appears on both
+        DMDs shows up as two separate soma blocks (one inside each DMD
+        block). Middle level is DMD.
+      - `group_by_soma=True`: soma first, then dend_type (alphabetical, e.g.
+        Apical → Basal) if a `dend_type` coord is present, otherwise DMD
+        (by `dmd_order` within each soma), then dendrite, then `pos`. All
+        dendrites belonging to a given soma are contiguous. Soma labels are
+        coloured red and dend_type labels are colour-coded by default
+        (Apical = orange, Basal = blue) to give the level a quick visual key.
+
+    Parameters
+    ----------
+    corr : xr.DataArray
+        Output of `pairwise_pearson_corr`, with dims ('syn_1', 'syn_2') and the
+        usual scopex coords mirrored on both dims as `<name>_1` / `<name>_2`.
+    DMD_first : int
+        Which DMD (1 or 2) is plotted first when ``dmd_order="DMD_first"``.
+    dmd_order : str | Sequence[int]
+        ``"DMD_first"`` (default), ``"depth"`` (most superficial DMD at the
+        top, from the ``dmd-depth_1`` coord) or an explicit DMD sequence.
+    group_by_soma : bool
+        If True, group synapses by soma first (see above).
+    soma_color : str | None
+        Colour for the soma-level brackets and labels. None → red when
+        `group_by_soma`, otherwise `bracket_color`.
+    dend_type_colors : Mapping[str, str] | None
+        Mapping from `dend_type` value → colour for the middle-level brackets
+        and labels (only consulted when the middle level is `dend_type`). None
+        → `{"Apical"/"apical": orange, "Basal"/"basal": blue}` when
+        `group_by_soma`, otherwise empty (all middle-level brackets use
+        `bracket_color`).
+    naked_matrix : bool
+        If True, plot only the matrix and the internal dendrite-division
+        lines — no colour bar, no brackets, no labels, no axis decorations.
+        Overrides `cbar_label`, `show_x_brackets`, and `show_y_brackets`.
+    dmd_boundary_lw : float | None
+        Line width of the lines separating the middle-level (DMD) blocks
+        inside the matrix; None → same as `boundary_lw`.
+    mask_diagonal : bool
+        Draw the diagonal (r = 1 by definition) in `nan_color` instead of
+        letting it dominate the colour scale.
+    nan_color : str | None
+        Colour of NaN cells (and of the diagonal when `mask_diagonal`).
+    dend_brackets, dmd_brackets, soma_brackets : bool
+        Draw the bracket level at all. A disabled level is dropped entirely
+        (bracket and label) and the remaining levels pack toward the axis.
+    label_rotation : Mapping[str, float] | None
+        Rotation (degrees) of the y-axis labels per level name (``"dend"``,
+        ``"dmd"`` / ``"dend_type"``, ``"soma"``); e.g. ``{"dmd": 90}`` writes
+        the DMD labels along their bracket. Applies to the left labels only.
+
+    Returns
+    -------
+    fig, ax, im
+    """
+    if naked_matrix:
+        cbar_label = None
+        show_x_brackets = False
+        show_y_brackets = False
+    if "syn_1" not in corr.dims or "syn_2" not in corr.dims:
+        raise ValueError("`corr` must have dims ('syn_1', 'syn_2').")
+    n = corr.sizes["syn_1"]
+    if n == 0:
+        raise ValueError("Empty correlation matrix.")
+    if corr.sizes["syn_2"] != n:
+        raise ValueError("Correlation matrix is not square.")
+
+    order = corr_matrix_order(
+        corr, DMD_first=DMD_first, dmd_order=dmd_order, group_by_soma=group_by_soma
+    )
+    dend_blocks = order.dend_blocks
+    middle_blocks = order.middle_blocks
+    soma_blocks = order.soma_blocks
+    use_dend_type_middle = order.middle_name == "dend_type"
+
+    if group_by_soma:
+        eff_soma_color = soma_color if soma_color is not None else "tab:red"
+        eff_dend_type_colors: Mapping[str, str] = (
+            dend_type_colors
+            if dend_type_colors is not None
+            else {
+                "Apical": "tab:orange",
+                "apical": "tab:orange",
+                "Basal": "tab:blue",
+                "basal": "tab:blue",
+            }
+        )
+    else:
+        eff_soma_color = soma_color if soma_color is not None else bracket_color
+        eff_dend_type_colors = dend_type_colors if dend_type_colors is not None else {}
+
+    if not use_dend_type_middle:
+        dmd_labels = _with_depth_labels(
+            dmd_labels, order.dmd_depth, lambda d, z: f"DMD {d}\n{z:g} µm"
+        )
+    soma_labels = _with_depth_labels(
+        soma_labels, order.soma_depth, lambda s, z: f"{s}\n{z:g} µm"
+    )
+
+    M = np.asarray(
+        corr.isel(syn_1=order.order_idx, syn_2=order.order_idx).values, dtype=float
+    )
+    if mask_diagonal:
+        M = M.copy()
+        np.fill_diagonal(M, np.nan)
+
     if ax is None:
         if figsize is None:
             side = max(5.0, min(14.0, n * 0.06 + 3.0))
@@ -281,10 +438,15 @@ def plot_slap2_corr_matrix(
     else:
         fig = ax.figure
 
+    cmap_obj = plt.get_cmap(cmap)
+    if nan_color is not None:
+        cmap_obj = cmap_obj.copy()
+        cmap_obj.set_bad(nan_color)
+
     extent = (-0.5, n - 0.5, n - 0.5, -0.5)
     im = ax.imshow(
         M,
-        cmap=cmap,
+        cmap=cmap_obj,
         vmin=vmin,
         vmax=vmax,
         aspect="equal",
@@ -300,18 +462,32 @@ def plot_slap2_corr_matrix(
         ax.axvline(
             top_row - 0.5, color=boundary_color, lw=boundary_lw, alpha=boundary_alpha
         )
+    if dmd_boundary_lw is not None and dmd_boundary_lw != boundary_lw:
+        for _, top_row, _ in middle_blocks[1:]:
+            for line in (ax.axhline, ax.axvline):
+                line(
+                    top_row - 0.5,
+                    color=boundary_color,
+                    lw=dmd_boundary_lw,
+                    alpha=boundary_alpha,
+                )
 
     ax.set_xticks([])
     ax.set_yticks([])
     for spine in ("top", "right", "left", "bottom"):
         ax.spines[spine].set_visible(False)
 
-    middle_name = "dend_type" if use_dend_type_middle else "dmd"
+    # Only the enabled levels are drawn; the rest pack toward the axis.
     levels: list[tuple[str, list[tuple], LabelOpt]] = [
-        ("dend", dend_blocks, dend_labels),
-        (middle_name, middle_blocks, dmd_labels),
-        ("soma", soma_blocks, soma_labels),
+        spec
+        for spec, enabled in (
+            (("dend", dend_blocks, dend_labels), dend_brackets),
+            ((order.middle_name, middle_blocks, dmd_labels), dmd_brackets),
+            (("soma", soma_blocks, soma_labels), soma_brackets),
+        )
+        if enabled
     ]
+    rotations = dict(label_rotation or {})
 
     def _color_for(level_name: str, key) -> str:
         if level_name == "soma":
@@ -361,17 +537,32 @@ def plot_slap2_corr_matrix(
                     clip_on=False,
                     solid_capstyle="butt",
                 )
-                ax.text(
-                    x_lab,
-                    (y_top + y_bot) / 2,
-                    _resolve_label(opt, key, name),
-                    transform=trans_y,
-                    ha="right",
-                    va="center",
-                    fontsize=label_fontsize,
-                    color=clr,
-                    clip_on=False,
-                )
+                rot = float(rotations.get(name, 0.0))
+                if rot:
+                    ax.text(
+                        x_lab - 0.014,
+                        (y_top + y_bot) / 2,
+                        _resolve_label(opt, key, name),
+                        transform=trans_y,
+                        ha="center",
+                        va="center",
+                        rotation=rot,
+                        fontsize=label_fontsize,
+                        color=clr,
+                        clip_on=False,
+                    )
+                else:
+                    ax.text(
+                        x_lab,
+                        (y_top + y_bot) / 2,
+                        _resolve_label(opt, key, name),
+                        transform=trans_y,
+                        ha="right",
+                        va="center",
+                        fontsize=label_fontsize,
+                        color=clr,
+                        clip_on=False,
+                    )
 
     if show_x_brackets:
         trans_x = blended_transform_factory(ax.transData, ax.transAxes)

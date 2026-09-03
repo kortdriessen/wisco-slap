@@ -53,11 +53,11 @@ def _write_audit_csv(root) -> None:
     (root / "ExSum_audits.csv").write_text(
         "\n".join(
             [
-                "subject,exp,loc,acq,scopex_status,events_matchfilt_status,"
-                "events_denoised_status,annotation_status,scoring_complete",
-                "subj,exp_1,loc_A,acq_1,fresh,not_applicable,fresh,fresh,true",
-                "subj,exp_1,loc_B,acq_1,fresh,missing,fresh,fresh,true",
-                "subj,exp_1,loc_C,acq_1,fresh,fresh,fresh,fresh,true",
+                "subject,exp,loc,acq,scopex_status,annotation_status,"
+                "scoring_complete",
+                "subj,exp_1,loc_A,acq_1,fresh,fresh,true",
+                "subj,exp_1,loc_B,acq_1,stale,fresh,true",
+                "subj,exp_1,loc_C,acq_1,fresh,fresh,true",
             ]
         ),
         encoding="utf-8",

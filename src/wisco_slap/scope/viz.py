@@ -10,7 +10,6 @@ from :mod:`wisco_slap.scope.corr`.
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
-import xarray as xr
 from matplotlib.cm import ScalarMappable
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Colormap, Normalize, to_rgba

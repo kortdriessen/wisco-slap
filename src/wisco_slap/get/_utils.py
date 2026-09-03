@@ -19,4 +19,6 @@ def combine_scopex_arrays(sxs: dict[str, xr.DataArray]) -> xr.DataArray:
             new_ids.append(f"{dmd}-{sid}")
         sxs[f"dmd_{dmd}"] = sxs[f"dmd_{dmd}"].assign_coords(syn_id=new_ids)
     mfs = xr.concat([sxs["dmd_1"], sxs["dmd_2"]], dim="syn_id")
+    syn_id_numbers = [int(x.split("-")[1]) for x in mfs["syn_id"].values]
+    mfs = mfs.assign_coords(syn_id_number=("syn_id", syn_id_numbers))
     return mfs

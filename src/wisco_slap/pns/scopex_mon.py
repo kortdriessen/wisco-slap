@@ -21,7 +21,6 @@ import os
 from dataclasses import dataclass
 
 import slap2_py as spy
-
 import wisco_slap as wis
 import wisco_slap.defs as DEFS
 from wisco_slap.pns import scopex_gen
