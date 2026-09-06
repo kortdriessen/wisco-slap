@@ -3,7 +3,6 @@
 # ==================================================================================
 
 import csv
-import json
 import os
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -13,6 +12,7 @@ import polars as pl
 import yaml
 
 from wisco_slap.defs import anmat_root, exsum_mirror_root, exsum_source_root
+from wisco_slap.meta.acq_types import NO_VALUE as _NO_VALUE
 
 
 # ==================================================================================
@@ -375,8 +375,43 @@ def _split_acq_id(acq_id: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+#: WISynaptic classification carrying the human "is this recording usable at all"
+#: judgement. Only :data:`BASELINE_VALID_LABEL` passes; every other label, and
+#: every unlabeled acquisition, is excluded by ``valid_acquisitions``.
+BASELINE_VALIDITY_CLASSIFICATION = "baseline_validity"
+BASELINE_VALID_LABEL = "valid"
+
+
+def _baseline_validity_lookup() -> dict[tuple[str, str, str, str], str]:
+    """Map ``(subject, exp, loc, acq)`` to its ``baseline_validity`` label.
+
+    Acquisitions absent from the returned mapping have never been seen by the
+    classifier; a value of ``wis.meta.acq_types.NO_VALUE`` means seen but not
+    yet labeled. Both count as unlabeled.
+    """
+    from wisco_slap.meta.acq_types import classification
+
+    try:
+        labels = classification(BASELINE_VALIDITY_CLASSIFICATION)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"valid_acquisitions(require_baseline_valid=True) needs the "
+            f"'{BASELINE_VALIDITY_CLASSIFICATION}' classification. {exc} Label "
+            f"acquisitions with WISynaptic's Classify button, or pass "
+            f"require_baseline_valid=False to skip the check."
+        ) from exc
+
+    return {
+        (row["subject"], row["exp"], row["loc"], row["acq"]): row["value"]
+        for row in labels.iter_rows(named=True)
+    }
+
+
 def valid_acquisitions(
-    *, refresh_audit: bool = False, exclude_cross_sb: bool = True
+    *,
+    refresh_audit: bool = False,
+    exclude_cross_sb: bool = True,
+    require_baseline_valid: bool = True,
 ) -> list[str]:
     """Return acquisition-master entries with all critical monitor items green.
 
@@ -392,6 +427,9 @@ def valid_acquisitions(
     - Whisk DF
     - Eye Metrics
     - Ephys
+
+    On top of those material checks, the human ``baseline_validity``
+    classification must read ``"valid"`` (see *require_baseline_valid*).
 
     ExSum-derived columns and scoring status are read from the same
     ``ExSum_audits.csv`` cache used by the WISynaptic status monitor. Pass
@@ -410,14 +448,33 @@ def valid_acquisitions(
         analysis-ready even when all material checks pass. Set False to
         include them and accept that downstream alignment is the caller's
         problem.
+    require_baseline_valid : bool
+        If True (default), additionally require that the acquisition is
+        labeled ``"valid"`` in the ``baseline_validity`` classification
+        (``annotation_materials/_CLASSIFICATIONS/baseline_validity.json``,
+        written by WISynaptic's Classify button). Any other label excludes
+        the acquisition, and so does having no label at all -- an unlabeled
+        acquisition that passes every material check is dropped with a
+        ``UserWarning`` naming it, since silently trusting an unreviewed
+        recording is the failure mode this check exists to prevent. A
+        one-line summary of everything excluded here is always printed.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``require_baseline_valid`` is True and the ``baseline_validity``
+        classification file does not exist.
     """
     master = acq_master()
     audit_lookup = _load_exsum_audit_lookup(refresh_audit=refresh_audit)
     dmd_info_data = dmd_info()
     sync_info_data = sync_info()
     epoch_info_data = epoch_info() if exclude_cross_sb else {}
+    baseline_labels = _baseline_validity_lookup() if require_baseline_valid else {}
 
     valid: list[str] = []
+    unlabeled: list[str] = []
+    not_baseline_valid: list[str] = []
     for subject, experiments in master.items():
         for exp, acq_ids in experiments.items():
             for acq_id in acq_ids:
@@ -453,9 +510,60 @@ def valid_acquisitions(
                     ).is_file(),
                     _ephys_is_complete(sb_dir),
                 )):
-                    valid.append(f"{subject}--{exp}--{loc}--{acq}")
+                    member = f"{subject}--{exp}--{loc}--{acq}"
+                    if not require_baseline_valid:
+                        valid.append(member)
+                        continue
+                    label = baseline_labels.get((subject, exp, loc, acq))
+                    if label == BASELINE_VALID_LABEL:
+                        valid.append(member)
+                    elif label is None or label == _NO_VALUE:
+                        unlabeled.append(member)
+                    else:
+                        not_baseline_valid.append(f"{member} ({label})")
 
+    _report_baseline_exclusions(unlabeled, not_baseline_valid)
     return valid
+
+
+def _report_baseline_exclusions(
+    unlabeled: list[str], not_baseline_valid: list[str]
+) -> None:
+    """Print a one-line exclusion summary and warn loudly about unlabeled acqs.
+
+    Acquisitions carrying a non-``"valid"`` label were excluded on purpose, so
+    they only appear in the summary line. Acquisitions with no label passed
+    every material check and were dropped solely because nobody has reviewed
+    them, which is worth a real warning.
+    """
+    import warnings
+
+    if not unlabeled and not not_baseline_valid:
+        return
+
+    parts = []
+    if not_baseline_valid:
+        parts.append(f"{len(not_baseline_valid)} labeled not-'{BASELINE_VALID_LABEL}'")
+    if unlabeled:
+        parts.append(f"{len(unlabeled)} unlabeled")
+    print(
+        f"valid_acquisitions: excluded {' and '.join(parts)} acquisition(s) on "
+        f"{BASELINE_VALIDITY_CLASSIFICATION}"
+        + (f" -- {', '.join(not_baseline_valid)}" if not_baseline_valid else "")
+    )
+
+    if unlabeled:
+        listed = "\n  ".join(unlabeled)
+        warnings.warn(
+            f"{len(unlabeled)} acquisition(s) pass every material check but have "
+            f"no '{BASELINE_VALIDITY_CLASSIFICATION}' label, so they are EXCLUDED "
+            f"from valid_acquisitions():\n  {listed}\n"
+            f"Label them with WISynaptic's Classify button (only "
+            f"'{BASELINE_VALID_LABEL}' passes), or call "
+            f"valid_acquisitions(require_baseline_valid=False) to ignore the "
+            f"classification entirely.",
+            stacklevel=3,
+        )
 
 
 def unique_acquisitions_per_experiment(subject, exp):
@@ -700,83 +808,3 @@ def esum_path_raw(subject: str, exp: str, loc: str, acq: str) -> str | None:
         return os.path.join(esum_dir, esum_files[0])
     else:
         raise ValueError(f"Multiple esum files found for {subject} {exp} {loc} {acq}")
-
-
-# ==================================================================================
-# 9. Acquisition classifications (WISynaptic "Classify" tool)
-# ==================================================================================
-def _classifications_dir() -> Path:
-    return Path(anmat_root) / "annotation_materials" / "_CLASSIFICATIONS"
-
-
-def classification_names() -> list[str]:
-    """Names of all saved acquisition classifications, sorted.
-
-    Classifications are created and labeled in WISynaptic via the "Classify"
-    toolbar button; each is one JSON file in
-    ``annotation_materials/_CLASSIFICATIONS/``.
-    """
-    cdir = _classifications_dir()
-    if not cdir.is_dir():
-        return []
-    return sorted(p.stem for p in cdir.glob("*.json"))
-
-
-def _load_classification_json(name: str) -> dict:
-    """Read one classification's raw JSON, with a helpful error if absent."""
-    path = _classifications_dir() / f"{name}.json"
-    if not path.is_file():
-        available = classification_names()
-        raise FileNotFoundError(
-            f"No classification named '{name}' at {path}. "
-            f"Available: {available}"
-        )
-    with open(path) as f:
-        return json.load(f)
-
-
-def classification_values(name: str) -> list[str]:
-    """Declared value scheme for one classification, in declaration order.
-
-    Parameters
-    ----------
-    name : str
-        Classification name, e.g. ``"sleep_condition"`` (see
-        :func:`classification_names`).
-
-    Returns
-    -------
-    list[str]
-        The values an acquisition may be labeled with, e.g.
-        ``["sd_early", "sleep_early", "sd_late", "sleep_late"]``. Does not
-        include ``"NO_VALUE"``, the placeholder recorded for acquisitions
-        that have been seen but not yet labeled.
-    """
-    return [entry["value"] for entry in _load_classification_json(name)["values"]]
-
-
-def classification(name: str) -> pl.DataFrame:
-    """Load one acquisition classification as a tidy dataframe.
-
-    Parameters
-    ----------
-    name : str
-        Classification name, e.g. ``"sleep_condition"`` (see
-        :func:`classification_names`).
-
-    Returns
-    -------
-    pl.DataFrame
-        One row per acquisition with columns ``subject``, ``exp``, ``loc``,
-        ``acq``, ``value``. A value of ``"NO_VALUE"`` means the acquisition
-        has not been labeled yet.
-    """
-    data = _load_classification_json(name)
-    schema = {
-        "subject": pl.String,
-        "exp": pl.String,
-        "loc": pl.String,
-        "acq": pl.String,
-        "value": pl.String,
-    }
-    return pl.DataFrame(data["labels"], schema=schema)

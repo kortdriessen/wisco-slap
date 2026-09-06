@@ -4,7 +4,6 @@ from . import synapto_anim as synapto_anim
 from . import synapto_overlays as synapto_overlays
 from . import tiff_movies as tiff_movies
 from ._overviews import all_soma_overview as all_soma_overview
-from ._overviews import single_soma_overview as single_soma_overview
 from .colors import two_color_cmap as two_color_cmap
 from .overview_and_summary_plots import (
     acq_within_exp_plot as acq_within_exp_plot,
@@ -39,7 +38,6 @@ __all__ = [
     "synapto_overlays",
     "tiff_movies",
     "two_color_cmap",
-    "single_soma_overview",
     "all_soma_overview",
     "overview_and_summary_plots",
     "basic_sync_summary_plot",

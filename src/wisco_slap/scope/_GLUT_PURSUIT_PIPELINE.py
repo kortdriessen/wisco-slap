@@ -819,6 +819,11 @@ def detectable_mask(
     an empty stretch of a raster that falls inside ``~detectable_mask`` means
     "could not be detected", not "no events". Cheap (no noise estimation), so
     it can be called on any subset of synapses, e.g. to shade rasters.
+
+    The returned array carries its own ``is_valid`` coord on ``time_dim``:
+    True where *every* synapse is detectable, False where any is not. Any
+    ``is_valid`` coord inherited from ``ls`` (which describes NaN-free
+    samples, not detectability) is replaced by this reduction.
     """
     if ls.ndim != 2 or time_dim not in ls.dims:
         raise ValueError(f"ls must be 2-D with a {time_dim!r} dim; got {ls.dims}")
@@ -830,6 +835,7 @@ def detectable_mask(
         np.asarray(ls_t.values, dtype=np.float32), _template_len(tau_s, fs)
     )
     out = xr.DataArray(valid, dims=ls_t.dims, coords=ls_t.coords, name="detectable")
+    out = out.assign_coords(is_valid=(time_dim, valid.all(axis=0)))
     return out.transpose(*ls.dims)
 
 

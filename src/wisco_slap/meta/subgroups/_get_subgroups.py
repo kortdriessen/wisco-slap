@@ -1,40 +1,106 @@
 """Loading of experimental subgroup sets.
 
+Membership is computed live: each set's generator script exposes a
+``members()`` function, and the loader calls it. Nothing is cached on disk, so
+a subgroup always reflects the current state of the data.
+
 See ``subgroup_info.md`` in this directory for the full description of what a
 subgroup set is, the folder layout every set must follow, and the
-generate -> review -> load workflow.
+generator-script contract.
 """
 
-import json
-import warnings
+import contextlib
+import importlib
+import io
 from pathlib import Path
-from typing import Literal
+from types import ModuleType
+from typing import Literal, overload
 
-from ..get import classification as _load_classification
-from ..get import classification_values as _load_classification_values
+import polars as pl
+
+from ..acq_types import classification as _load_classification
+from ..acq_types import classification_values as _load_classification_values
 
 SUBGROUPS_ROOT = Path(__file__).resolve().parent
 
+ACQ_ID_FIELDS = ("subject", "exp", "loc", "acq")
+
+#: Column name for the set-specific unit suffix of a member ID (the part after
+#: ``subject--exp--loc--acq``) when ``return_df=True``. Sets not listed here
+#: fall back to ``"unit"``.
+UNIT_COLUMN_NAMES: dict[str, str] = {"single_soma": "soma_id"}
+
 
 def list_subgroup_sets() -> list[str]:
-    """Names of all subgroup sets that have a generated candidate set.
+    """Names of all subgroup sets defined under the subgroups package.
 
-    A set counts as present when
-    ``<set_name>/candidate_set/candidate_set.json`` exists under the
-    subgroups package directory.
+    A set counts as present when its generator script
+    ``<set_name>/<set_name>.py`` exists (the same-name rule of the folder
+    contract in ``subgroup_info.md``).
     """
     return sorted(
-        path.parent.parent.name
-        for path in SUBGROUPS_ROOT.glob("*/candidate_set/candidate_set.json")
+        path.parent.name
+        for path in SUBGROUPS_ROOT.glob("*/*.py")
+        if path.stem == path.parent.name
     )
+
+
+def _set_module(set_name: str) -> ModuleType:
+    """Import the generator module of subgroup set ``set_name``."""
+    script = SUBGROUPS_ROOT / set_name / f"{set_name}.py"
+    if not script.is_file():
+        raise FileNotFoundError(
+            f"No subgroup set '{set_name}': expected a generator script at "
+            f"{script}. Available subgroup sets: {list_subgroup_sets()}"
+        )
+    return importlib.import_module(f"{__package__}.{set_name}.{set_name}")
+
+
+def _set_members(set_name: str, verbose: bool) -> list[str]:
+    """Call the ``members()`` entry point of subgroup set ``set_name``."""
+    module = _set_module(set_name)
+    members_fn = getattr(module, "members", None)
+    if not callable(members_fn):
+        raise AttributeError(
+            f"The generator script for subgroup '{set_name}' "
+            f"({SUBGROUPS_ROOT / set_name / f'{set_name}.py'}) does not define "
+            "a members() function. Every subgroup set must expose "
+            "members(verbose: bool = True) -> list[str]; see subgroup_info.md."
+        )
+    if verbose:
+        return list(members_fn(verbose=True))
+    # Generators pull in helpers (valid_acquisitions, ...) that print
+    # unconditionally, so verbose=False is enforced here rather than plumbed
+    # through every dependency.
+    with contextlib.redirect_stdout(io.StringIO()):
+        return list(members_fn(verbose=False))
+
+
+@overload
+def load_subgroup_set(
+    set_name: str,
+    classification: dict[str, str | list[str]] | None = ...,
+    verbose: bool = ...,
+    return_df: Literal[False] = ...,
+) -> list[str]: ...
+
+
+@overload
+def load_subgroup_set(
+    set_name: str,
+    classification: dict[str, str | list[str]] | None = ...,
+    verbose: bool = ...,
+    *,
+    return_df: Literal[True],
+) -> pl.DataFrame: ...
 
 
 def load_subgroup_set(
     set_name: str,
-    version: Literal["valid", "candidates"] = "valid",
     classification: dict[str, str | list[str]] | None = None,
     verbose: bool = True,
-) -> list[str]:
+    return_df: bool = False,
+) -> list[str] | pl.DataFrame:
     """Load the member identifiers of an experimental subgroup.
 
     Parameters
@@ -42,63 +108,55 @@ def load_subgroup_set(
     set_name : str
         Name of the subgroup directory, such as ``"single_soma"`` (see
         :func:`list_subgroup_sets`).
-    version : {"valid", "candidates"}, optional
-        Which set to load. ``"candidates"`` returns everything the generator
-        script found (``candidate_set.json``). ``"valid"`` (the default)
-        returns only candidates that a human has marked ``"valid"`` during
-        Lighttable review (``.lt-annotations/validity.json``); candidates
-        marked anything else, or not yet reviewed, are dropped.
     classification : dict, optional
         Further filter the returned set on acquisition-level classifications
         (the JSON files in ``annotation_materials/_CLASSIFICATIONS/``, see
-        ``wis.meta.get.classification``). Keys are classification names,
+        ``wis.meta.acq_types.classification``). Keys are classification names,
         values are one allowed value or a list of allowed values, e.g.
         ``{"sleep_condition": "sd_early"}`` or
         ``{"sleep_condition": ["sd_early", "sd_late"]}``. Multiple keys are
         combined with AND. Requested values are checked against the
         classification's declared value scheme, so typos raise immediately.
-        Candidates whose acquisition is unlabeled (absent or ``"NO_VALUE"``)
+        Members whose acquisition is unlabeled (absent or ``"NO_VALUE"``)
         are dropped.
     verbose : bool, optional
-        Print a one-line summary of how many candidates survived each
-        filtering stage. Defaults to ``True``.
+        Print the generator's selection log and a one-line summary of how many
+        members survived each filtering stage. Defaults to ``True``.
+    return_df : bool, optional
+        If ``True``, return the members as a polars DataFrame with the member
+        IDs split on ``"--"`` into ``subject``, ``exp``, ``loc``, ``acq`` and,
+        when the set appends a unit suffix, one more column named per
+        :data:`UNIT_COLUMN_NAMES` (``soma_id`` for ``single_soma``, ``unit``
+        for sets without an entry). Defaults to ``False``.
 
     Returns
     -------
-    list[str]
-        Member identifiers in candidate-set order, formatted as
-        ``"subject--exp--loc--acq"`` plus any set-specific suffix
-        (e.g. ``"--soma1"`` for ``single_soma``).
+    list[str] or pl.DataFrame
+        By default, member identifiers in the order the set's generator
+        produced them, formatted as ``"subject--exp--loc--acq"`` plus any
+        set-specific suffix (e.g. ``"--soma1"`` for ``single_soma``). With
+        ``return_df=True``, the same members as one DataFrame row each (same
+        order).
 
     Raises
     ------
     FileNotFoundError
-        If the subgroup (or, for ``version="valid"``, its validity
-        annotations) does not exist.
+        If the subgroup does not exist.
+    AttributeError
+        If the subgroup's generator script does not expose ``members()``.
     ValueError
-        If ``version`` is unrecognized, or a requested classification value
-        is not part of that classification's declared scheme.
+        If a requested classification value is not part of that
+        classification's declared scheme.
+
+    Notes
+    -----
+    Membership is recomputed on every call by running the set's inclusion
+    criteria against the current data — there is no cached member list, so a
+    subgroup can never go stale. For ``single_soma`` this takes a few seconds.
     """
-    set_dir = SUBGROUPS_ROOT / set_name
-    candidate_set_path = set_dir / "candidate_set" / "candidate_set.json"
-    if not candidate_set_path.is_file():
-        raise FileNotFoundError(
-            f"No candidate set for subgroup '{set_name}' at {candidate_set_path}. "
-            f"Available subgroup sets: {list_subgroup_sets()}"
-        )
-    with candidate_set_path.open(encoding="utf-8") as file:
-        candidates: list[str] = json.load(file)
+    members = _set_members(set_name, verbose)
 
-    summary = [f"subgroup '{set_name}': {len(candidates)} candidates"]
-
-    if version == "candidates":
-        members = list(candidates)
-    elif version == "valid":
-        members = _validated_subset(candidates, set_dir, set_name, summary)
-    else:
-        raise ValueError(
-            f"version must be 'valid' or 'candidates', got {version!r}."
-        )
+    summary = [f"subgroup '{set_name}': {len(members)} members"]
 
     if classification is not None:
         members = _apply_classification_filter(
@@ -107,48 +165,34 @@ def load_subgroup_set(
 
     if verbose:
         print(" | ".join(summary))
+    if return_df:
+        return members_to_df(members, set_name)
     return members
 
 
-def _validated_subset(
-    candidates: list[str],
-    set_dir: Path,
-    set_name: str,
-    summary: list[str],
-) -> list[str]:
-    """Restrict ``candidates`` to those marked ``"valid"`` in Lighttable."""
-    validity_path = set_dir / "candidate_set" / ".lt-annotations" / "validity.json"
-    if not validity_path.is_file():
-        raise FileNotFoundError(
-            f"No validity annotations for subgroup '{set_name}' at "
-            f"{validity_path}. Review the main_overview images in Lighttable "
-            "to create them, or load the unreviewed set with "
-            "version='candidates'."
-        )
-    with validity_path.open(encoding="utf-8") as file:
-        marks = {
-            member_id: item.get("mark")
-            for member_id, item in json.load(file)["items"].items()
-        }
+def members_to_df(members: list[str], set_name: str) -> pl.DataFrame:
+    """Split member IDs into one row per member with one column per field.
 
-    stale = sorted(set(marks) - set(candidates))
-    if stale:
-        warnings.warn(
-            f"validity.json for subgroup '{set_name}' has {len(stale)} mark(s) "
-            f"for IDs not in candidate_set.json (left over from an older "
-            f"candidate set?): {stale}. Re-review after regenerating the "
-            "candidate set.",
-            stacklevel=3,
+    The first four ``--``-separated fields become ``subject``, ``exp``,
+    ``loc``, ``acq``; any remaining suffix becomes a single extra column named
+    per :data:`UNIT_COLUMN_NAMES` (only present when at least one member has
+    a suffix). Column order is preserved from the IDs.
+    """
+    unit_col = UNIT_COLUMN_NAMES.get(set_name, "unit")
+    rows: list[dict[str, str | None]] = []
+    for member_id in members:
+        parts = member_id.split("--")
+        _acq_key(member_id, set_name)  # validates the four-field prefix
+        row: dict[str, str | None] = dict(
+            zip(ACQ_ID_FIELDS, parts[:4], strict=True)
         )
-
-    kept = [c for c in candidates if marks.get(c) == "valid"]
-    n_not_valid = sum(1 for c in candidates if c in marks and marks[c] != "valid")
-    n_unreviewed = sum(1 for c in candidates if c not in marks)
-    summary.append(
-        f"validated: {len(kept)} kept "
-        f"({n_not_valid} marked not-valid, {n_unreviewed} unreviewed)"
-    )
-    return kept
+        row[unit_col] = "--".join(parts[4:]) if len(parts) > 4 else None
+        rows.append(row)
+    schema = {**{f: pl.String for f in ACQ_ID_FIELDS}, unit_col: pl.String}
+    df = pl.DataFrame(rows, schema=schema)
+    if df.get_column(unit_col).is_null().all():
+        df = df.drop(unit_col)
+    return df
 
 
 def _apply_classification_filter(

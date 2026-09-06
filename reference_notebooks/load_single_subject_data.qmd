@@ -1,0 +1,196 @@
+# SLAP2, Single Subject data loading pipeline
+---
+For a single acquisition, this notebook will show the basics of how to load all relevant data and ensure it is ready for further analysis. 
+
+```{python}
+import wisco_slap as wis
+```
+
+```{python}
+```
+
+# Define acquisition
+
+the below cell defines the information you need to get basically all other information, the subject name, experiment name, location name, and acquisition name
+
+```{python}
+# An acquisition is defined by a subject, experiment, location, and acquisition name.
+subject = 'bellatrix'
+exp = 'exp_1'
+loc = 'loc_Z'
+acq = 'acq_1'
+
+# we will also define one soma that we will use to show how to do soma-specific filtering
+soma_id = 'soma1'
+
+# Here we get the sync-block for this acquisition, which can be tied to e.g. the video, ephys, etc.
+sb = wis.meta.sync.get_acq_sync_block(subject, exp, loc, acq)
+```
+
+# Activity Data (SLAP2 activity traces)
+
+There are broadly two classes of activity traces that we care about:
+1. The traces from the localized synapses (or 'sources'). These can either glutamate traces or calcium traces.
+2. The traces from manually identified ROIs (i.e. cells or somas), and for these we typically only care about the calcium signal. 
+
+For the activity data, we should be using the wisco_slap.get._standard_loading_routines functions I've written, since these will load and refine the data in a standard way, and always return data with the same structure.
+
+## Synaptic dF traces
+
+First, we load the glutamate traces, we will start with the signal which is closest to truly 'raw' data, which is the 'ls' signal.
+
+```{python}
+ls = wis.get.fetch_data_pipe(
+    pipeline='synapse',
+    subject=subject,
+    exp=exp,
+    loc=loc,
+    acq=acq,
+    soma_id=soma_id,
+    trace='ls',
+    channel=1,
+    dend_only=True, 
+    valid_mask=True
+)
+```
+
+Note that the ls and denoised arrays are in units of dF. If you want to convert to dF/F0, you can load the F0 traces per synapse in the same way:
+
+```{python}
+f0 = wis.get.fetch_data_pipe(
+    pipeline='synapse',
+    subject=subject,
+    exp=exp,
+    loc=loc,
+    acq=acq,
+    soma_id=soma_id,
+    trace='f0',
+    channel=1,
+    dend_only=True,
+    valid_mask=True
+)
+```
+
+we also may want to get the calcium traces from the synapses (which hopefully reflect something like calcium in the spine),
+to do this we simply change the channel parameter, to channel-0 for the calcium (red) channel:
+
+
+```{python}
+ls_ca = wis.get.fetch_data_pipe(
+    pipeline='synapse',
+    subject=subject,
+    exp=exp,
+    loc=loc,
+    acq=acq,
+    soma_id=soma_id,
+    trace='ls',
+    channel=0,
+    dend_only=True,
+    valid_mask=True
+)
+```
+
+Finally, for either channel, it may be the case that we want some other signal type (not ls), e.g. the 'denoised' signal. 
+Denoised is probably the only other signal (besides ls) that we will want to load directly. Here, you just change the 'trace' parameter to 'denoised':
+
+```{python}
+dn = wis.get.fetch_data_pipe(
+    pipeline='synapse',
+    subject=subject,
+    exp=exp,
+    loc=loc,
+    acq=acq,
+    soma_id=soma_id,
+    trace='denoised',
+    channel=1,
+    dend_only=True,
+    valid_mask=True
+)
+```
+
+### Manipulations of Synaptic Data
+
+There are various other relatively standard things we may want to do to this data after we've loaded it, this section reviews a few of those:
+
+---------------
+Some samples are NaN to do censoring those frame in the prepro pipeline, we may want to, for some analyses, ensure that we are only using timepoints for which ALL synapses have valid data. This can be quickly done to any scopex array using the 'unify_valid_samples()' accessor:
+
+```{python}
+dn = dn.sx.unify_valid_samples()
+```
+
+---------------
+It may often be the case that rather than using the 'noisy' ls signal, we want to use a matched-filtered version of the signal, which is a better estimate of the underlying glutamate signal. This can be done as follows:
+
+```{python}
+mf = wis.scope.pro.ls_to_matched_filter(ls)
+```
+
+## Soma Calcium Traces
+
+Here, our pipeline function should return the following:
+
+1. the actual raw dF/F scopex array
+2. The 'cascade' outputs - i.e. the continuous spike probability timeseries, and the estimated discrete spike times
+
+We should apply the standard filtering values to the cascade events by default, unless we have good reason not to.
+
+As part of the standard loading routine, we by default use the 'Fsvd' trace rather than 'Fraw', and we also return the dF/F version of the trace rather than the raw F trace.
+
+```{python}
+soma_ca, spike_prob, spikes = wis.get.fetch_data_pipe(
+    pipeline='soma',
+    subject=subject,
+    exp=exp,
+    loc=loc,
+    acq=acq,
+    soma_id=soma_id,
+    trace='Fsvd',
+    channel=0,
+    return_dFF=True,
+    spike_prob_thresh=0.4,
+    min_separation_sec=0.2,
+)
+```
+
+The cell above gets exactly the data we wanted:
+- soma_ca: the svd dF/F scopex array
+- spike_prob: the continuous spike probability timeseries from cascade
+- spikes: the estimated discrete spike times from cascade
+
+# Mean image and footprint overlays
+
+```{python}
+meanIM, syn_map, fp_vals = wis.get.fetch_data_pipe(
+    pipeline='footprints',
+    subject=subject,
+    exp=exp,
+    loc=loc,
+    acq=acq,
+    fp_threshold=0.01,
+)
+```
+
+# Peripherals --> Ephys, Pupil Metrics, Hypnograms
+
+```{python}
+ephys, eye, whisk, hypno_acq, hypno_full, acq_dur = wis.get.fetch_data_pipe(
+    pipeline='peripherals',
+    subject=subject,
+    exp=exp,
+    loc=loc,
+    acq=acq,
+    stores=['EEG_', 'loal']
+)
+```
+
+you may want to dice up the hypnogram into discrete bouts of uniform duration, and then add a large amount of context to each bout. You can get the contextualized diced hypnogram (ctx_hypno) using the following:
+
+```{python}
+full_hypno_diced = hypno_full.diced_hypno(chunk_size='5s', min_bout_dur='7s', mode='middle')
+
+ctx_hypno = wis.peri.anno.add_peripheral_context_to_hypno(
+    full_hypno_diced, ephys['EEG_'], eye, whisk, state_ref=hypno_full, norm_state="NREM",
+    validity_mask=dn.is_valid,
+)
+```

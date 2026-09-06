@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
+import wisco_slap.meta.acq_types._classifications as meta_classifications
 import wisco_slap.meta.get as meta_get
 
 
@@ -98,10 +103,38 @@ def _write_sync_block_files(root, sync_block: int) -> None:
     (sb_dir / "ephys" / "EEGr.nc").touch()
 
 
-def test_valid_acquisitions_filters_to_complete_red_arrow_items(
-    monkeypatch, tmp_path
-) -> None:
+def _write_baseline_validity(root, labels: dict[str, str]) -> None:
+    """Write a baseline_validity classification; keys are ``loc`` names."""
+    cdir = root / "annotation_materials" / "_CLASSIFICATIONS"
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / "baseline_validity.json").write_text(
+        json.dumps(
+            {
+                "name": "baseline_validity",
+                "values": [
+                    {"value": "valid", "hotkey": "v"},
+                    {"value": "invalid", "hotkey": "x"},
+                ],
+                "labels": [
+                    {
+                        "subject": "subj",
+                        "exp": "exp_1",
+                        "loc": loc,
+                        "acq": "acq_1",
+                        "value": value,
+                    }
+                    for loc, value in labels.items()
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _setup_all_material_checks_pass(monkeypatch, tmp_path) -> None:
+    """Everything green for loc_A only; loc_B is stale, loc_C mislabeled."""
     monkeypatch.setattr(meta_get, "anmat_root", str(tmp_path))
+    monkeypatch.setattr(meta_classifications, "anmat_root", str(tmp_path))
     _write_required_yaml(tmp_path)
     _write_audit_csv(tmp_path)
 
@@ -111,4 +144,59 @@ def test_valid_acquisitions_filters_to_complete_red_arrow_items(
     for sync_block in (1, 2, 3):
         _write_sync_block_files(tmp_path, sync_block)
 
+
+def test_valid_acquisitions_filters_to_complete_red_arrow_items(
+    monkeypatch, tmp_path
+) -> None:
+    _setup_all_material_checks_pass(monkeypatch, tmp_path)
+    _write_baseline_validity(tmp_path, {"loc_A": "valid"})
+
     assert meta_get.valid_acquisitions() == ["subj--exp_1--loc_A--acq_1"]
+
+
+def test_valid_acquisitions_excludes_non_valid_baseline_label(
+    monkeypatch, tmp_path
+) -> None:
+    _setup_all_material_checks_pass(monkeypatch, tmp_path)
+    _write_baseline_validity(tmp_path, {"loc_A": "invalid"})
+
+    assert meta_get.valid_acquisitions() == []
+
+
+def test_valid_acquisitions_excludes_unlabeled_with_warning(
+    monkeypatch, tmp_path
+) -> None:
+    _setup_all_material_checks_pass(monkeypatch, tmp_path)
+    # loc_A is absent from the file entirely; loc_B carries the seen-but-unlabeled
+    # placeholder (it fails a material check anyway, so it must not be named).
+    _write_baseline_validity(tmp_path, {"loc_B": meta_classifications.NO_VALUE})
+
+    with pytest.warns(UserWarning, match="no 'baseline_validity' label"):
+        assert meta_get.valid_acquisitions() == []
+
+
+def test_valid_acquisitions_placeholder_label_counts_as_unlabeled(
+    monkeypatch, tmp_path
+) -> None:
+    _setup_all_material_checks_pass(monkeypatch, tmp_path)
+    _write_baseline_validity(tmp_path, {"loc_A": meta_classifications.NO_VALUE})
+
+    with pytest.warns(UserWarning, match="subj--exp_1--loc_A--acq_1"):
+        assert meta_get.valid_acquisitions() == []
+
+
+def test_valid_acquisitions_can_skip_the_baseline_check(monkeypatch, tmp_path) -> None:
+    _setup_all_material_checks_pass(monkeypatch, tmp_path)
+    # No classification file at all: the check would raise, the escape hatch must not.
+    assert meta_get.valid_acquisitions(require_baseline_valid=False) == [
+        "subj--exp_1--loc_A--acq_1"
+    ]
+
+
+def test_valid_acquisitions_requires_the_classification_file(
+    monkeypatch, tmp_path
+) -> None:
+    _setup_all_material_checks_pass(monkeypatch, tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="require_baseline_valid=False"):
+        meta_get.valid_acquisitions()

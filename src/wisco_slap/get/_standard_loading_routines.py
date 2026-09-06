@@ -1,3 +1,5 @@
+import polars as pl
+
 import slap2_py as spy
 import wisco_slap as wis
 
@@ -60,6 +62,8 @@ def _piped_soma(
     trace="Fraw",
     channel=0,
     return_dFF=True,
+    spike_prob_thresh=0.4,
+    min_separation_sec=0.2,
 ):
     soma_dmd = None
     dmd_info = wis.meta.get.dmd_info()
@@ -92,6 +96,13 @@ def _piped_soma(
     soma_roi = roi.sel(soma_id=soma_id)
     soma_roi = wis.validity.attach_validity(soma_roi)
     spike_prob, spikes = wis.scope.cascade.run_cascade_detection(soma_roi)
+    spikes = spikes.filter(pl.col("spike_prob") > spike_prob_thresh)
+    spikes = wis.scope.cascade.filter_cascade_spikes(
+        spikes,
+        min_separation_sec=min_separation_sec,
+        time_col="time",
+        priority="spike_prob",
+    )
     return soma_roi, spike_prob, spikes
 
 

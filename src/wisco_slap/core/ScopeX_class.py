@@ -10,6 +10,7 @@ Usage:
 
 from __future__ import annotations
 
+import numpy as np
 import xarray as xr
 
 TimeLike = int | float
@@ -161,3 +162,44 @@ class ScopeXAccessor:
             Soma identifier (e.g. 'soma1').
         """
         return self._obj.sel(soma_id=soma_id)
+
+    # ── validity handling ────────────────────────────────────────
+
+    def unify_valid_samples(self) -> xr.DataArray:
+        """NaN out every synapse at timepoints where any synapse is NaN.
+
+        The validity mask is derived directly from the data: a timepoint is
+        valid only if every value at that timepoint (across ``syn_id`` /
+        ``soma_id`` and ``channel``, if present) is non-NaN. All values at
+        invalid timepoints are then set to NaN, so every synapse shares one
+        NaN pattern and per-syn and pooled statistics use one denominator.
+
+        Any pre-existing ``is_valid`` coord is ignored and replaced by the
+        freshly derived mask, so the coord on the returned array always
+        matches its NaN pattern.
+
+        Returns
+        -------
+        xr.DataArray
+            A float-typed copy with unified NaNs and an ``is_valid`` coord on
+            the time dim. All other coordinates and attrs are preserved.
+
+        Raises
+        ------
+        ValueError
+            If the array has no ``time`` dim.
+        """
+        da = self._obj
+        if "time" not in da.dims:
+            raise ValueError("`unify_valid_samples` requires a 'time' dim.")
+        other_dims = [d for d in da.dims if d != "time"]
+        valid = da.notnull().all(dim=other_dims) if other_dims else da.notnull()
+        valid = xr.DataArray(
+            np.asarray(valid.values, dtype=bool),
+            dims=("time",),
+            coords={"time": da["time"]},
+        )
+        # `where` can drop non-dim coords, so restore them explicitly.
+        out = da.where(valid)
+        out = out.assign_coords(da.coords).assign_attrs(da.attrs)
+        return out.assign_coords(is_valid=("time", valid.values))

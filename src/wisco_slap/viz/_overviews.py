@@ -71,11 +71,11 @@ def _resolve_out_path(
 ) -> tuple[Path, Path]:
     """Resolve the output directory and PNG path for an overview figure.
 
-    ``out_dir == "default"`` maps to ``<cwd>/candidate_set/<default_subdir>``.
-    The directory is not created here; that happens only when saving.
+    ``out_dir == "default"`` maps to ``<cwd>/<default_subdir>``. The directory
+    is not created here; that happens only when saving.
     """
     if out_dir == "default":
-        out_dir = Path.cwd() / "candidate_set" / default_subdir
+        out_dir = Path.cwd() / default_subdir
     else:
         out_dir = Path(out_dir)
     return out_dir, out_dir / filename
@@ -229,126 +229,6 @@ def _somas_with_ca_traces(subject: str, exp: str, loc: str, acq: str) -> list[st
     return soma_ids
 
 
-def single_soma_overview(
-    subject: str,
-    exp: str,
-    loc: str,
-    acq: str,
-    soma_id: str,
-    out_dir: str | Path = "default",
-    dpi: int = 300,
-    save: bool = True,
-    overwrite: bool = True,
-) -> tuple[plt.Figure, np.ndarray] | Path:
-    """Build and save the MAIN_OVERVIEW figure for one soma in a single acquisition.
-
-    Rows, top to bottom: EEG, load cell, pupil diameter, pupil motion,
-    whisking, the soma's dF/F trace (with inferred spikes), then one
-    glutamate-SNR heatmap per DMD for the dendritic synapses of that soma.
-
-    Parameters
-    ----------
-    subject, exp, loc, acq
-        Acquisition identifiers, e.g. ``"bellatrix", "exp_1", "loc_Z", "acq_1"``.
-    soma_id
-        Which soma within the acquisition to use, e.g. ``"soma1"``. Selects both
-        the somatic trace and the dendrites/synapses attributed to that soma.
-    out_dir
-        Directory to write the PNG into. Created if it does not exist. The
-        default is ``<cwd>/candidate_set/main_overview``.
-    dpi
-        Resolution of the saved PNG.
-    save
-        Whether to save the generated figure. When ``False``, the figure is
-        still built and returned.
-    overwrite
-        Whether to overwrite an existing file at the output path. If ``False`` and
-        the file exists, nothing is built and the existing path is returned.
-
-    Returns
-    -------
-    (fig, axes)
-        The figure and its array of axes; or the existing output ``Path`` when
-        ``save=True``, ``overwrite=False`` and the file already exists.
-    """
-    fp.style.use_lighttable()
-    wis.util.checks.validate_ids(exp, loc, acq)
-    out_dir, out_path = _resolve_out_path(
-        out_dir, "main_overview", f"{subject}--{exp}--{loc}--{acq}--{soma_id}.png"
-    )
-    if save and out_path.exists() and not overwrite:
-        print(f"File already exists: {out_path}. Skipping.")
-        return out_path
-
-    dn = wis.get.fetch_data_pipe(
-        pipeline="synapse",
-        subject=subject,
-        exp=exp,
-        loc=loc,
-        acq=acq,
-        soma_id=soma_id,
-        trace="denoised",
-        channel=0,
-        dend_only=True,
-        valid_mask=True,
-    )
-    soma_ca, _spike_prob, spikes = wis.get.fetch_data_pipe(
-        pipeline="soma",
-        subject=subject,
-        exp=exp,
-        loc=loc,
-        acq=acq,
-        soma_id=soma_id,
-        trace="Fraw",
-        channel=0,
-        return_dFF=True,
-    )
-    ephys, eye, whisk, _hypno_acq, hypno_full, acq_dur = wis.get.fetch_data_pipe(
-        pipeline="peripherals",
-        subject=subject,
-        exp=exp,
-        loc=loc,
-        acq=acq,
-        stores=["EEG_", "loal"],
-    )
-    eeg = ephys["EEG_"]
-    loal = ephys["loal"]
-    mfsnr = _syn_snr_image(dn)
-
-    f, ax = plt.subplots(8, 1, figsize=(_FIG_WIDTH_IN, _ROW_HEIGHT_IN * 8), sharex=True)
-    acq_mins = round(acq_dur / 60, 1)
-    _soma_dmd, soma_depth = wis.meta.get.soma_dmd(
-        subject, exp, loc, acq, soma_id, return_depth=True
-    )
-    f.suptitle(
-        f"{subject} -- {exp} -- {loc} -- {acq} -- {soma_id}"
-        f" | Soma Depth: {soma_depth:.1f}um | {acq_mins} mins",
-        fontsize=18,
-    )
-    _plot_peripheral_panels(ax[:5], eeg, loal, eye, whisk, hypno_full)
-    _plot_soma_panel(ax[5], soma_ca, spikes)
-    _plot_syn_heatmap_panel(ax[6], mfsnr, 1)
-    _plot_syn_heatmap_panel(ax[7], mfsnr, 2)
-
-    _set_shared_xlim(
-        ax[0],
-        [
-            eeg.time.values,
-            loal.time.values,
-            eye["time"].to_numpy(),
-            whisk["time"].to_numpy(),
-            soma_ca.time.values,
-            dn.time.values,
-        ],
-    )
-
-    if save:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        f.savefig(out_path, dpi=dpi, bbox_inches="tight")
-    # plt.close(f)
-    return f, ax
-
-
 def all_soma_overview(
     subject: str,
     exp: str,
@@ -361,11 +241,10 @@ def all_soma_overview(
 ) -> tuple[plt.Figure, np.ndarray] | Path:
     """Build and save the MAIN_OVERVIEW figure for every soma in an acquisition.
 
-    Same layout as :func:`single_soma_overview`, but after the five peripheral
-    rows (EEG, load cell, pupil diameter, pupil motion, whisking) there is one
-    block of three rows per soma: the soma's dF/F trace (with inferred spikes)
-    followed by the dmd-1 and dmd-2 glutamate-SNR heatmaps of the dendritic
-    synapses attributed to that soma.
+    After the five peripheral rows (EEG, load cell, pupil diameter, pupil
+    motion, whisking) there is one block of three rows per soma: the soma's
+    dF/F trace (with inferred spikes) followed by the dmd-1 and dmd-2
+    glutamate-SNR heatmaps of the dendritic synapses attributed to that soma.
 
     "Every soma" means every soma with a calcium ROI trace, i.e. the ROI labels
     recorded in ``dmd_info.yaml`` (dmd-1 somas first, then dmd-2). IDs that only
@@ -377,7 +256,7 @@ def all_soma_overview(
         Acquisition identifiers, e.g. ``"bellatrix", "exp_1", "loc_Z", "acq_1"``.
     out_dir
         Directory to write the PNG into. Created if it does not exist. The
-        default is ``<cwd>/candidate_set/all_soma_overview``.
+        default is ``<cwd>/all_soma_overview``.
     dpi
         Resolution of the saved PNG.
     save

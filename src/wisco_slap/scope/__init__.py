@@ -2,6 +2,7 @@
 subpackage for dealing with data from SLAP2 microscope
 """
 
+from . import _GECO_PURSUIT_PIPELINE as gecopur
 from . import _GLUT_PURSUIT_PIPELINE as pursuit
 from . import anat as anat
 from . import cascade as cascade
@@ -22,6 +23,7 @@ __all__ = [
     "pro",
     "viz",
     "pursuit",
+    "gecopur",
     "master_event_detector",
     "detect_basic_events",
 ]

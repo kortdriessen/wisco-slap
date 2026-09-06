@@ -61,14 +61,15 @@ def _all_acquisitions() -> list[tuple[str, ...]]:
 def _single_soma_members() -> list[tuple[str, ...]]:
     """Every ``(subject, exp, loc, acq, soma_id)`` of the single-soma subgroup.
 
-    Computed live by ``single_soma_acqs`` (the subgroup's inclusion criteria
-    applied to ``wis.meta.get.valid_acquisitions()``), so the set always
-    reflects the current data rather than a possibly stale candidate file.
+    Goes through ``wis.meta.subgroups.load_subgroup_set``, which recomputes the
+    subgroup's inclusion criteria against the current data on every call — so
+    the plot set and any analysis loading the subgroup always see the same
+    members.
     """
     # imported lazily: the subgroup generator imports wisco_slap at module level
-    from wisco_slap.meta.subgroups.single_soma.single_soma import single_soma_acqs
+    from wisco_slap.meta.subgroups import load_subgroup_set
 
-    return [tuple(member.split("--")) for member in single_soma_acqs()]
+    return [tuple(m.split("--")) for m in load_subgroup_set("single_soma")]
 
 
 def set_members(set: str) -> list[tuple[str, ...]]:

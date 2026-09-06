@@ -1,72 +1,14 @@
 """Generator for the ``single_soma`` subgroup (see ``../subgroup_info.md``).
 
 ``single_soma_acqs`` applies the inclusion criteria to the current valid
-acquisitions and returns the member ids; running this file as a script writes
-``candidate_set/candidate_set.json`` and fills ``candidate_set/main_overview/``
-with one PNG per candidate. The overview PNGs are the ``single_soma_overview``
-plot of the ``single_soma`` plot set (``wis.viz.overview_and_summary_plots``),
-generated through ``wis.pns.overview_plot_gen.generate_plot_set`` (which also
-writes a blank placeholder + ``--ERROR.txt`` sidecar when a plot fails) and
-copied here so the review set stays complete.
+acquisitions and returns the member ids; ``members`` is the subgroup-set entry
+point that ``wis.meta.subgroups.load_subgroup_set`` calls. Membership is always
+computed live, so running this file as a script just prints the current set.
 """
-
-import argparse
-import json
-import shutil
-from pathlib import Path
 
 import polars as pl
 
 import wisco_slap as wis
-
-
-def write_main_overviews(
-    candidates: list[str],
-    overview_dir: Path,
-    *,
-    replace: bool = False,
-) -> list[Path]:
-    """Populate ``overview_dir`` with the single-soma overview of each candidate.
-
-    Runs ``wis.pns.overview_plot_gen.generate_plot_set("single_soma",
-    overwrite=replace)`` (idempotent: existing, non-errored plots are skipped
-    unless ``replace``) and then copies each candidate's PNG from the plot
-    set's output directory into ``overview_dir``. Failed plots arrive as the
-    generator's blank placeholder, so there is always exactly one PNG per
-    candidate; candidates the generator did not produce (it iterates the same
-    ``single_soma_acqs`` selection, so this only happens if the data changed
-    between the two calls) are reported and skipped.
-
-    Returns
-    -------
-    list[Path]
-        The PNG written (or refreshed) for each candidate, in candidate order.
-    """
-    wis.pns.overview_plot_gen.generate_plot_set("single_soma", overwrite=replace)
-    overview_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-    for candidate in candidates:
-        ids = candidate.split("--")
-        src = wis.viz.overview_and_summary_plots.single_soma_overview_path(*ids)
-        dst = overview_dir / f"{candidate}.png"
-        if not src.exists():
-            print(f"No overview was generated for {candidate}; expected {src}")
-            continue
-        shutil.copy2(src, dst)
-        written.append(dst)
-    print(f"Copied {len(written)} / {len(candidates)} overview PNGs to {overview_dir}")
-    return written
-
-
-def _parse_args() -> argparse.Namespace:
-    """Parse command-line options for overview generation."""
-    parser = argparse.ArgumentParser(description="Generate single-soma overviews.")
-    parser.add_argument(
-        "--replace",
-        action="store_true",
-        help="Replace existing overview PNGs instead of skipping them.",
-    )
-    return parser.parse_args()
 
 
 def _soma_syn_stats(syn_info: pl.DataFrame, soma_id: str) -> tuple[int, int, int]:
@@ -98,7 +40,9 @@ def _soma_syn_stats(syn_info: pl.DataFrame, soma_id: str) -> tuple[int, int, int
 
 
 def single_soma_acqs(
-    min_n_synapses: int = 40, min_duration_seconds: float = 1200
+    min_n_synapses: int = 40,
+    min_duration_seconds: float = 1200,
+    verbose: bool = True,
 ) -> list[str]:
     """Return member IDs for somas passing the single-soma inclusion criteria.
 
@@ -114,6 +58,8 @@ def single_soma_acqs(
         Minimum number of dendrite-assigned synapses on the soma.
     min_duration_seconds : float
         Minimum duration of the acquisition in seconds.
+    verbose : bool
+        Print the per-acquisition tie-break decisions and the final count.
 
     Returns
     -------
@@ -146,7 +92,7 @@ def single_soma_acqs(
             continue
         # Tuple comparison implements the tiebreak priority order directly.
         best_stats, best_soma = max(candidates)
-        if len(candidates) > 1:
+        if verbose and len(candidates) > 1:
             losers = ", ".join(s for _, s in candidates if s != best_soma)
             print(
                 f"{v}: {len(candidates)} eligible somas; keeping {best_soma} "
@@ -155,20 +101,35 @@ def single_soma_acqs(
             )
         tot_n_syns += best_stats[2]
         valid_soma_acqs.append(f"{subject}--{exp}--{loc}--{acq}--{best_soma}")
-    print(
-        f"{len(valid_soma_acqs)} somas with at least {min_n_synapses} synapses"
-        f" | total synapses across all somas: {tot_n_syns}"
-    )
+    if verbose:
+        print(
+            f"{len(valid_soma_acqs)} somas with at least {min_n_synapses} synapses"
+            f" | total synapses across all somas: {tot_n_syns}"
+        )
     return valid_soma_acqs
 
 
-if __name__ == "__main__":
-    args = _parse_args()
-    acqs = single_soma_acqs()
+def members(verbose: bool = True) -> list[str]:
+    """The current members of the ``single_soma`` subgroup.
 
-    script_dir = Path(__file__).resolve().parent
-    candidate_set_path = script_dir / "candidate_set" / "candidate_set.json"
-    candidate_set_path.parent.mkdir(parents=True, exist_ok=True)
-    candidate_set_path.write_text(json.dumps(acqs, indent=2) + "\n")
-    overview_dir = candidate_set_path.parent / "main_overview"
-    write_main_overviews(acqs, overview_dir, replace=args.replace)
+    The subgroup-set entry point required by the folder contract (see
+    ``../subgroup_info.md``): ``wis.meta.subgroups.load_subgroup_set`` calls
+    this on every load, so membership is always recomputed from the current
+    data. Applies :func:`single_soma_acqs` with the standard criteria.
+
+    Parameters
+    ----------
+    verbose : bool
+        Forwarded to :func:`single_soma_acqs`.
+
+    Returns
+    -------
+    list[str]
+        Member IDs formatted as ``"subject--exp--loc--acq--soma#"``.
+    """
+    return single_soma_acqs(verbose=verbose)
+
+
+if __name__ == "__main__":
+    for member in members():
+        print(member)

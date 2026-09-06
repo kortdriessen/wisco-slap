@@ -2,6 +2,7 @@
 subpackage for dealing with peripherals (ephys, video, syncrhonization, etc.)
 """
 
+from . import acq_types as acq_types
 from . import dmd_info as dmd_info
 from . import epoch as epoch
 from . import exsum_mirror as exsum_mirror
@@ -14,6 +15,7 @@ from ._update import update as update
 from .get import acq_timing as get_acq_timing
 
 __all__ = [
+    "acq_types",
     "sync",
     "epoch",
     "prepro_info",
