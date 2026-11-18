@@ -10,10 +10,10 @@ TIFFs via :mod:`wisco_slap.pns.aligned_frames`.
 Prox lines are drawn starting at the proximal end, so each disc carries an
 ``arc_um`` coordinate (0 = proximal endpoint, increasing distally) — the axis
 for propagation/attenuation analyses. The output time coordinate follows the
-scopex convention exactly (concatenated-trial samples at the TIFF rate,
-~80 Hz, built with the same helper as the ``syn_dF`` arrays, including
-multi-epoch offsets), so shaft-calcium traces align with scopex arrays and
-ephys the same way everything else does.
+scopex trial boundaries exactly, including NaN-placeholder duration for
+dropped trials and multi-epoch offsets. TIFF frames are spaced within each
+trial's analyzed duration (~80 Hz); the time coordinate is authoritative
+when per-trial frame rounding makes the interval slightly nonuniform.
 
 Outputs per acquisition, in
 ``analysis_materials/<subject>/<exp>/scopex/<loc>--<acq>/shaft_ca/``:
@@ -42,6 +42,7 @@ spread, and event-averaged lead/lag versus the soma.
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import tempfile
 from collections import Counter
@@ -49,6 +50,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# NOTE: do NOT call matplotlib.use("Agg") here — a module-level backend switch
+# hijacks the inline backend of any notebook that imports wisco_slap. The QC
+# figure below is created and closed around savefig, which works on any backend.
+import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np
 import polars as pl
 import tifffile
@@ -59,15 +64,16 @@ from scipy.sparse import csr_matrix
 from scipy.stats import gaussian_kde
 from spine_labeller.core import disk_mask, sample_polyline
 
+import slap2_py as spy
 import wisco_slap as wis
-from slap2_py.core.xarr_summ import _build_time_coord
 from wisco_slap.defs import anmat_root, annotation_root
 from wisco_slap.pns import aligned_frames as frames
-
-# NOTE: do NOT call matplotlib.use("Agg") here — a module-level backend switch
-# hijacks the inline backend of any notebook that imports wisco_slap. The QC
-# figure below is created and closed around savefig, which works on any backend.
-import matplotlib.pyplot as plt  # noqa: E402
+from wisco_slap.pns._frame_timing import (
+    SHAFT_TIME_AXIS_VERSION,
+    SHAFT_TIME_CONVENTION,
+    fill_dropped_trial_counts,
+    scopex_frame_times,
+)
 
 # Prox lines saved before this date were drawn against pre-channel-fix
 # reference images (2026-08 reprocessing) and are not trusted: shaft-calcium
@@ -515,7 +521,6 @@ def acq_data(
             F = disc_means_over_blocks(cache["values"], column_lists)
             quality = np.asarray(cache["quality_valid"], dtype=bool)
             trial_index = np.asarray(cache["trial_index"], dtype=np.int32)
-            sample_rate = float(cache.attrs["sample_rate_hz"])
         finally:
             if temp_root is not None:
                 shutil.rmtree(temp_root, ignore_errors=True)
@@ -524,10 +529,11 @@ def acq_data(
         frame_counts = np.bincount(trial_index, minlength=context.n_trials + 1)[1:]
         epochs = frames.trial_epochs(context.exsum_path, context.n_trials)
         offsets = _epoch_offsets(subject, exp, loc, acq, epochs)
-        time_coord = _build_time_coord(
+        time_coord, sample_rate = scopex_frame_times(
             [int(c) for c in frame_counts],
-            sample_rate,
-            epochs if offsets is not None else None,
+            frames.per_trial_sample_counts(context.exsum_path, dmd, context.n_trials),
+            context.analyze_hz,
+            epochs,
             offsets,
         )
 
@@ -563,10 +569,8 @@ def acq_data(
                 "disc_spacing_um": disc_spacing_um,
                 "prox_lines_csv": str(csv_path),
                 "arc_convention": "arc_um=0 at the proximal end of each line",
-                "time_convention": (
-                    "scopex: concatenated-trial samples / sample_rate_hz, "
-                    "multi-epoch offsets applied"
-                ),
+                "time_convention": SHAFT_TIME_CONVENTION,
+                "time_axis_version": SHAFT_TIME_AXIS_VERSION,
                 "created_at": datetime.now(UTC).isoformat(),
             },
         )
@@ -612,6 +616,130 @@ def acq_data(
     _atomic_json(info, out_dir / "shaft_ca_info.json")
     _write_markers(out_dir, esum_version, fingerprints)
     return summary
+
+
+def repair_time_coordinates(
+    subject: str,
+    exp: str,
+    loc: str,
+    acq: str,
+    *,
+    dmd: int | None = None,
+    dry_run: bool = False,
+) -> list[dict[str, Any]]:
+    """Repair legacy shaft clocks without reading TIFFs or changing fluorescence.
+
+    Requires current ExSum/prox-line markers and verifies trial order and Scopex
+    length before writing. Only ``time`` and clock metadata change. Original
+    time chunks and metadata are backed up under ``shaft_ca/timing_backups``;
+    a failed write restores them. Current-version outputs are left untouched.
+    """
+    esum = Path(wis.meta.get.esum_mirror_path(subject, exp, loc, acq))
+    version = esum.stem
+    directory = shaft_ca_dir(subject, exp, loc, acq)
+    _, n_trials, analyze_hz = spy.xsum.get_exsum_basics(esum)
+    epochs = frames.trial_epochs(esum, n_trials)
+    offsets = _epoch_offsets(subject, exp, loc, acq, epochs)
+    records = []
+    # Validate every requested DMD before mutating any output.
+    plans = []
+    for d in [dmd] if dmd is not None else [1, 2]:
+        path = directory / f"shaft_ca_dmd{d}.zarr"
+        if not path.is_dir():
+            if dmd is not None:
+                raise FileNotFoundError(path)
+            continue
+        cache = zarr.open_group(str(path), mode="r")
+        record = {"dmd": d, "path": str(path)}
+        if cache.attrs.get("time_axis_version") == SHAFT_TIME_AXIS_VERSION:
+            records.append(record | {"status": "current"})
+            continue
+        if cache.attrs.get("time_axis_version", 1) != 1:
+            raise ValueError(f"DMD{d}: unsupported shaft time-axis version")
+        if (
+            cache.attrs.get("esum_version") != version
+            or not (directory / f"shaft_ca__{version}.txt").is_file()
+        ):
+            raise ValueError(
+                f"DMD{d}: stale ExSum; regenerate traces before clock repair"
+            )
+        marker = directory / f"shaft_ca__prox_lines_dmd{d}.txt"
+        csv = prox_lines_csv(subject, exp, loc, acq, d)
+        if not marker.is_file() or marker.read_text().strip() != prox_lines_fingerprint(
+            csv
+        ):
+            raise ValueError(
+                f"DMD{d}: stale prox lines; regenerate traces before clock repair"
+            )
+        trials = np.asarray(cache["trial"])
+        if trials.ndim != 1 or np.any(trials != np.floor(trials)):
+            raise ValueError(f"DMD{d}: invalid trial identities")
+        if not len(trials) or trials.min() < 1 or trials.max() > n_trials:
+            raise ValueError(f"DMD{d}: trial identities outside current ExSum")
+        counts = np.bincount(trials.astype(int), minlength=n_trials + 1)[1:]
+        if not np.array_equal(trials, np.repeat(np.arange(1, n_trials + 1), counts)):
+            raise ValueError(f"DMD{d}: shaft samples are not in original trial order")
+        analyzed = frames.per_trial_sample_counts(esum, d, n_trials)
+        new_time, rate = scopex_frame_times(
+            counts, analyzed, analyze_hz, epochs, offsets
+        )
+        expected_samples = int(fill_dropped_trial_counts(analyzed, epochs).sum())
+        scopex_path = directory.parent / "syn_F0.zarr"
+        if scopex_path.is_dir():
+            with xr.open_zarr(scopex_path, group=f"dmd_{d}") as scopex:
+                if scopex.sizes["time"] != expected_samples:
+                    raise ValueError(
+                        f"DMD{d}: reconstructed trial lengths differ from Scopex"
+                    )
+        old_time = np.asarray(cache["time"])
+        if old_time.shape != new_time.shape or cache["F"].shape[-1] != len(new_time):
+            raise ValueError(f"DMD{d}: incompatible shaft/time shapes")
+        record |= {
+            "status": "would_repair" if dry_run else "repaired",
+            "old_rate_hz": float(cache.attrs["sample_rate_hz"]),
+            "new_rate_hz": rate,
+            "max_time_change_s": float(np.max(np.abs(new_time - old_time))),
+        }
+        records.append(record)
+        plans.append((path, new_time, rate, record))
+    if dry_run:
+        return records
+    for path, new_time, rate, record in plans:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = directory / "timing_backups" / f"dmd{record['dmd']}_{stamp}"
+        backup.mkdir(parents=True)
+        shutil.copytree(path / "time", backup / "time")
+        for name in (".zattrs", ".zmetadata"):
+            if (path / name).is_file():
+                shutil.copy2(path / name, backup / name)
+        try:
+            cache = zarr.open_group(str(path), mode="a")
+            cache["time"][:] = new_time
+            cache.attrs.update({
+                "sample_rate_hz": rate,
+                "time_axis_version": SHAFT_TIME_AXIS_VERSION,
+                "time_convention": SHAFT_TIME_CONVENTION,
+                "time_axis_repaired_at": datetime.now(UTC).isoformat(),
+                "previous_sample_rate_hz": record["old_rate_hz"],
+            })
+            zarr.consolidate_metadata(str(path))
+            with xr.open_zarr(path) as verified:
+                if not np.array_equal(verified.time.values, new_time):
+                    raise RuntimeError(
+                        f"DMD{record['dmd']}: clock repair failed readback"
+                    )
+            record["backup"] = str(backup)
+            (backup / "repair.json").write_text(json.dumps(record, indent=2))
+        except Exception:
+            shutil.rmtree(path / "time")
+            shutil.copytree(backup / "time", path / "time")
+            for name in (".zattrs", ".zmetadata"):
+                if (backup / name).is_file():
+                    shutil.copy2(backup / name, path / name)
+                elif (path / name).exists():
+                    (path / name).unlink()
+            raise
+    return records
 
 
 def spy_mean_image(context: frames.AcqContext, dmd: int) -> np.ndarray:

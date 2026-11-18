@@ -45,6 +45,9 @@ def sb_bout_hypno(
     sb: int,
     reformat: bool = True,
     version: str = "model",
+    *,
+    apply_substates: bool = True,
+    **substate_kwargs,
 ) -> Hypnogram | pl.DataFrame | None:
     """Load the bout-level hypnogram of one sync block.
 
@@ -64,7 +67,14 @@ def sb_bout_hypno(
         Whether to reformat the loaded DataFrame into a ``Hypnogram``.
     version : str
         ``"validated"`` loads ``bout_hypno_VALIDATED.csv``; ``"model"``
-        (default) loads ``model_scored/bout_hypno.csv``.
+        (default) loads ``model_scored/bout_hypno.csv`` and applies substates.
+    apply_substates : bool
+        Model hypnograms default to Active wake / Quiet wake / NREM SWS /
+        NREM sigma / REM. False loads original broad labels without EEG/video.
+        Validated annotations are always returned unchanged.
+    **substate_kwargs
+        Forwarded to ``wis.peri.anno.load_auto_hypno``, e.g.
+        ``step3_config={'sigma_slow_min': 1.2}``. All passes use the full block.
 
     Returns
     -------
@@ -80,8 +90,46 @@ def sb_bout_hypno(
         return hypno_csv(validated_path, reformat=reformat)
 
     model_scored_path = os.path.join(hypno_dir, "model_scored", "bout_hypno.csv")
-    if os.path.exists(model_scored_path) and version == "model":
-        return hypno_csv(model_scored_path, reformat=reformat)
+    model_parquet_path = os.path.join(hypno_dir, "model_scored", "bout_df.parquet")
+    legacy_path = os.path.join(
+        anmat_root,
+        subject,
+        exp,
+        "scoring_data",
+        f"sync_block-{sb}",
+        "hypnograms",
+        "model_labelled",
+        "raw_epochs.csv",
+    )
+    if version == "model" and any(
+        os.path.exists(p) for p in [model_scored_path, model_parquet_path, legacy_path]
+    ):
+        from wisco_slap.peri.anno import load_auto_hypno
+
+        table = load_auto_hypno(
+            subject,
+            exp,
+            sb,
+            rename=False,
+            apply_substates=apply_substates,
+            **substate_kwargs,
+        )
+        if isinstance(table, dict):
+            raise ValueError(
+                "Use wis.peri.anno.load_auto_hypno(return_details=True) for audit tables."
+            )
+        frame = pl.from_pandas(table)
+        return (
+            Hypnogram(
+                frame.rename({
+                    "start_s": "start_time",
+                    "end_s": "end_time",
+                    "label": "state",
+                })
+            )
+            if reformat
+            else frame
+        )
     warnings.warn(
         f"No bout hypnogram found for {subject}/{exp} sync_block-{sb} "
         f"(checked {validated_path} and {model_scored_path}).",
@@ -97,6 +145,9 @@ def bout_hypno(
     acq: str,
     reformat: bool = True,
     version: str = "model",
+    *,
+    apply_substates: bool = True,
+    **substate_kwargs,
 ) -> Hypnogram | pl.DataFrame | None:
     """Load the bout-level hypnogram for the sync block containing this acquisition.
 
@@ -116,19 +167,32 @@ def bout_hypno(
     reformat : bool
         Whether to reformat the loaded DataFrame.
     version : str
-        The version of the hypnogram to load. If "validated",
-        the validated version is preferred, otherwise the model-scored version is used.
+        "validated" loads validated annotations only; "model" loads automatic
+        model annotations. A missing requested version returns None with a warning.
+    apply_substates : bool
+        Apply the three-pass detector to automatic model labels (default True).
+        False loads broad labels. Validated/manual labels are never subsetted.
+    **substate_kwargs
+        Detector and loading options passed to ``wis.peri.anno.load_auto_hypno``.
 
     Returns
     -------
     pl.DataFrame | Hypnogram | None
-        The bout hypnogram, or ``None`` if neither file exists for this sync
-        block (in which case a warning is emitted).
+        The bout hypnogram, or ``None`` if the requested version is absent
+        (in which case a warning is emitted).
         Returns pl.DataFrame if ``reformat=False``, otherwise a Hypnogram.
     """
     si = _get_sync_info()
     sb = si[subject][exp]["acquisitions"][f"{loc}--{acq}"]["sync_block"]
-    return sb_bout_hypno(subject, exp, sb, reformat=reformat, version=version)
+    return sb_bout_hypno(
+        subject,
+        exp,
+        sb,
+        reformat=reformat,
+        version=version,
+        apply_substates=apply_substates,
+        **substate_kwargs,
+    )
 
 
 def acq_sleep_coverage(
@@ -174,8 +238,12 @@ def acq_sleep_coverage(
     hypno_acq = hypno.trim(start, stop)
     fa = hypno_acq.fractional_occupancy()
     fractions = dict(zip(fa["state"].to_list(), fa["fraction"].to_list(), strict=True))
-    fraction_wake = fractions.get("Wake", 0.0)
-    fraction_nrem = fractions.get("NREM", 0.0)
+    fraction_wake = sum(
+        fractions.get(s, 0.0) for s in ["Wake", "Active wake", "Quiet wake"]
+    )
+    fraction_nrem = sum(
+        fractions.get(s, 0.0) for s in ["NREM", "NREM SWS", "NREM sigma"]
+    )
     fraction_rem = fractions.get("REM", 0.0)
     return hypno_acq, duration, fraction_wake, fraction_nrem, fraction_rem
 
@@ -219,6 +287,9 @@ def acq_sleep_table(version: str = "model") -> pl.DataFrame:
     from wisco_slap.meta.get import acq_master
 
     rows: list[dict] = []
+    # Reuse a block within this table call; do not rerun full EEG calibration
+    # for every acquisition from that block. No persistent/stale cache.
+    hypno_cache: dict[tuple[str, str, int], Hypnogram | None] = {}
     for subject, exps in acq_master().items():
         for exp, acq_ids in exps.items():
             for acq_id in acq_ids:
@@ -264,7 +335,12 @@ def acq_sleep_table(version: str = "model") -> pl.DataFrame:
 
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    hypno = bout_hypno(subject, exp, loc, acq, version=version)
+                    key = (subject, exp, timing.sync_block)
+                    if key not in hypno_cache:
+                        hypno_cache[key] = bout_hypno(
+                            subject, exp, loc, acq, version=version
+                        )
+                    hypno = hypno_cache[key]
                 if hypno is None:
                     notes.append("no hypnogram")
                     row["note"] = "; ".join(notes)
@@ -272,8 +348,14 @@ def acq_sleep_table(version: str = "model") -> pl.DataFrame:
                     continue
 
                 clipped = hypno.trim(timing.start_time, timing.end_time).df
+                from wisco_slap.defs import substate_parent
+
                 per_state = dict(
-                    clipped.group_by("state").agg(pl.col("duration").sum()).iter_rows()
+                    clipped
+                    .with_columns(pl.col("state").replace(substate_parent))
+                    .group_by("state")
+                    .agg(pl.col("duration").sum())
+                    .iter_rows()
                 )
                 extra = set(per_state) - set(_TABLE_STATES)
                 if extra:

@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import bisect
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from math import gcd
 
 import numpy as np
@@ -104,21 +104,34 @@ def _prepare_for_cascade(
     Returns
     -------
     dff_ds : np.ndarray
-        Resampled, NaN-filled dF/F at ``fs_target``.
+        Resampled, NaN-filled dF/F near ``fs_target`` (the exact input clock
+        is preserved rather than rounded).
     t_ds : np.ndarray
-        Resampled time axis (seconds), anchored at ``t[0]`` so absolute/ephys
-        time is preserved.
+        Resampled time axis (seconds), anchored at ``t[0]`` with the effective
+        sampling rate ``fs_orig * round(fs_target) / round(fs_orig)``.
     longmask_ds : np.ndarray of bool
         True where the resampled sample falls inside a long (> ``long_gap_s``)
         original NaN gap.
     fs_orig : float
         The estimated original sampling rate (Hz).
     """
-    fs_orig = 1.0 / np.median(np.diff(t))
+    t = np.asarray(t, dtype=np.float64)
+    if t.ndim != 1 or t.size < 2 or not np.isfinite(t).all():
+        raise ValueError("CASCADE needs at least two finite time samples.")
+    delta = np.diff(t)
+    dt = float(np.median(delta))
+    if dt <= 0 or not np.allclose(delta, dt, rtol=1e-6, atol=1e-9):
+        raise ValueError("Resample each regular, contiguous timestamp run separately.")
+    fs_orig = 1.0 / dt
     y = np.asarray(dff, float).copy()
-    nan = np.isnan(y)
+    if y.shape != t.shape:
+        raise ValueError("The dF/F and time arrays must have the same 1-D shape.")
+    nan = ~np.isfinite(y)
     idx = np.arange(len(y))
-    y[nan] = np.interp(idx[nan], idx[~nan], y[~nan])  # fill all NaNs (linear)
+    if (~nan).any():
+        y[nan] = np.interp(idx[nan], idx[~nan], y[~nan])
+    else:
+        y[:] = np.nan
 
     longmask = np.zeros(len(y), bool)  # mark long gaps to exclude later
     i = 0
@@ -133,13 +146,49 @@ def _prepare_for_cascade(
         else:
             i += 1
 
-    # rational resample (e.g. 200 -> 30 Hz exactly, 200 * 3 / 20 = 30)
+    if not np.isfinite(fs_target) or round(fs_target) < 1 or round(fs_orig) < 1:
+        raise ValueError("Source and target sampling rates must round to positive Hz.")
+    # Use the nominal rational filter (e.g. 3/20), but preserve the actual
+    # input clock. Clock-corrected SLAP2 fs is ~199.999206, not exactly 200;
+    # assigning exactly 30 Hz would otherwise introduce accumulating drift.
     g = gcd(int(round(fs_target)), int(round(fs_orig)))
     up, down = int(round(fs_target)) // g, int(round(fs_orig)) // g
     dff_ds = resample_poly(y, up, down)
-    t_ds = t[0] + np.arange(len(dff_ds)) / fs_target
+    fs_effective = fs_orig * up / down
+    t_ds = t[0] + np.arange(len(dff_ds)) / fs_effective
+    # resample_poly rounds length upward; its final sample can fall outside
+    # the observed input interval for very short/non-divisible runs.
+    inside = t_ds <= t[-1] + 1e-9
+    dff_ds, t_ds = dff_ds[inside], t_ds[inside]
     longmask_ds = np.interp(t_ds, t, longmask.astype(float)) > 0.5
     return dff_ds, t_ds, longmask_ds, fs_orig
+
+
+def _discrete_indices(
+    spike_prob: np.ndarray, infer: Callable[..., tuple], **kwargs
+) -> np.ndarray:
+    """Infer independent finite spans and restore CascadeTorch's bin indices.
+
+    CascadeTorch's discrete fitter removes NaNs and adds ``first_finite - 1``
+    to its local indices. Passing an entirely finite span therefore returns
+    indices one bin early. Correct that offset explicitly, then restore the
+    span's original position. Splitting also prevents internal NaNs from
+    compressing the time axis or joining independent supports.
+    """
+    finite = np.isfinite(spike_prob)
+    edges = np.diff(np.r_[False, finite, False].astype(np.int8))
+    indices = []
+    for start, stop in zip(
+        np.flatnonzero(edges == 1), np.flatnonzero(edges == -1), strict=True
+    ):
+        _, spikes = infer(spike_prob[None, start:stop], **kwargs)
+        local = np.asarray(spikes[0], dtype=np.int64) + 1
+        if ((local < 0) | (local >= stop - start)).any():
+            raise RuntimeError(
+                "CASCADE discrete inference returned an invalid sample index."
+            )
+        indices.append(local + start)
+    return np.sort(np.concatenate(indices)) if indices else np.array([], dtype=np.int64)
 
 
 def _as_single_soma_trace(
@@ -242,10 +291,12 @@ def run_cascade_detection(
     Returns
     -------
     spike_prob : xr.DataArray
-        Continuous CASCADE prediction (expected spikes per bin) at ``fs_target``,
+        Continuous CASCADE prediction (expected spikes per bin) near ``fs_target``,
         dims ``(time,)``, named ``"cascade_spike_prob"``, with ``soma_id`` tied
         in as a scalar coordinate and recorded in ``.attrs``. Edge windows are
-        NaN (CASCADE ``padding=np.nan``). This is the notebook's ``dff_30_preds``.
+        NaN (CASCADE ``padding=np.nan``). Actual timestamp gaps are split before
+        inference; the returned axis retains those gaps. ``attrs['fs']`` is
+        the effective, clock-preserving sample rate; ``model_fs`` is nominal.
     cascade_spikes : pl.DataFrame
         Discrete spikes with columns ``time`` (seconds, on the same axis as
         ``spike_prob``), ``soma_id`` (str), and ``spike_prob`` (the continuous
@@ -259,19 +310,21 @@ def run_cascade_detection(
     :func:`filter_cascade_spikes` for that.
     """
     da, soma_id = _as_single_soma_trace(soma_dff, soma_id)
-    t = da.coords["time"].values
-    dff = da.values
-
-    dff_ds, traces_time, _longmask_ds, fs_orig = _prepare_for_cascade(
-        t, dff, fs_target=fs_target, long_gap_s=long_gap_s
-    )
+    t = np.asarray(da.coords["time"].values, dtype=np.float64)
+    dff = np.asarray(da.values, dtype=np.float64)
+    if t.size < 2 or not np.isfinite(t).all() or (np.diff(t) <= 0).any():
+        raise ValueError("CASCADE needs finite, strictly increasing time samples.")
+    dt = float(np.median(np.diff(t)))
+    fs_orig = 1.0 / dt
+    # A missing interval must not become adjacent samples during filtering.
+    run_edges = np.r_[0, np.flatnonzero(np.diff(t) > 1.5 * dt) + 1, t.size]
 
     if model_folder is None:
         model_folder = DEFS.cascade_model_folder
 
     # --- lazy CASCADE / torch imports (see module docstring) ---
     import torch
-    from cascade2p import cascade
+    from cascade2p import cascade, config
     from cascade2p.utils_discrete_spikes import infer_discrete_spikes
 
     model_dir = os.path.join(model_folder, model_name)
@@ -283,42 +336,63 @@ def run_cascade_detection(
     elif isinstance(device, str):
         device = torch.device(device)
 
-    spike_prob = cascade.predict(
-        model_name,
-        dff_ds[None, :],
-        model_folder=model_folder,
-        device=device,
-        verbosity=verbosity,
-    )
-    spike_prob = np.asarray(spike_prob)
+    model_config = config.read_config(os.path.join(model_dir, "config.yaml"))
+    window_size = int(model_config["windowsize"])
+    probabilities, times, spike_times, spike_values = [], [], [], []
+    for start, stop in zip(run_edges[:-1], run_edges[1:], strict=True):
+        if stop - start < 2:
+            continue
+        dff_ds, traces_time, _longmask_ds, _ = _prepare_for_cascade(
+            t[start:stop], dff[start:stop], fs_target=fs_target, long_gap_s=long_gap_s
+        )
+        if dff_ds.size < window_size or not np.isfinite(dff_ds).any():
+            prediction = np.full(dff_ds.size, np.nan)
+        else:
+            prediction = np.asarray(
+                cascade.predict(
+                    model_name,
+                    dff_ds[None, :],
+                    model_folder=model_folder,
+                    device=device,
+                    verbosity=verbosity,
+                )
+            )[0]
+        idxs = _discrete_indices(
+            prediction,
+            infer_discrete_spikes,
+            model_name=model_name,
+            model_folder=model_folder,
+            verbosity=verbosity,
+        )
+        probabilities.append(prediction)
+        times.append(traces_time)
+        spike_times.append(traces_time[idxs])
+        spike_values.append(prediction[idxs])
+    prediction = np.concatenate(probabilities) if probabilities else np.array([])
+    traces_time = np.concatenate(times) if times else np.array([])
+    fs_effective = fs_orig * round(fs_target) / round(fs_orig)
 
     spike_prob_da = xr.DataArray(
-        spike_prob[0].astype(np.float32),
+        prediction.astype(np.float32),
         dims=["time"],
         coords={"time": traces_time, "soma_id": soma_id},
         name="cascade_spike_prob",
         attrs={
             "trace_type": "cascade_spike_prob",
             "model_name": model_name,
-            "fs": float(fs_target),
+            "fs": float(fs_effective),
+            "model_fs": float(fs_target),
             "source_fs": float(fs_orig),
+            "n_timestamp_runs": int(len(run_edges) - 1),
             "soma_id": soma_id,
         },
     )
 
-    # discrete spikes: returns (approximations_2d, spikes_list); spikes_list[0]
-    # is this (single) neuron's list of spike-sample indices.
-    _approx, spikes_list = infer_discrete_spikes(
-        spike_prob, model_name, model_folder=model_folder, verbosity=verbosity
-    )
-    idxs = np.asarray(spikes_list[0], dtype=int)
-    cascade_spikes = pl.DataFrame(
-        {
-            "time": traces_time[idxs],
-            "soma_id": soma_id,
-            "spike_prob": spike_prob[0, idxs],
-        }
-    )
+    cascade_spikes = pl.DataFrame({
+        "time": np.concatenate(spike_times) if spike_times else np.array([]),
+        "soma_id": soma_id,
+        "spike_prob": np.concatenate(spike_values) if spike_values else np.array([]),
+    })
 
     return spike_prob_da, cascade_spikes
 
@@ -394,8 +468,7 @@ def filter_cascade_spikes(
         prio = prio.astype(float)
         if prio.shape[0] != n:
             raise ValueError(
-                f"priority length ({prio.shape[0]}) must match number of "
-                f"spikes ({n})."
+                f"priority length ({prio.shape[0]}) must match number of spikes ({n})."
             )
         cand = np.where(finite & np.isfinite(prio))[0]
         cand = cand[np.argsort(prio[cand], kind="stable")[::-1]]  # high -> low

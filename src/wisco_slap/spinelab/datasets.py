@@ -553,10 +553,13 @@ def generate_spine_labelling_dataset(
 
     Notes
     -----
-    For multi-epoch acquisitions the bin ``start/end/duration_seconds`` are
-    wall-clock relative to the first trial, so bins spanning an epoch gap
-    report a duration that includes the gap. This only affects the time
-    labels shown in the labeller, not the images.
+    Bin ``start/end/duration_seconds`` are seconds since the first trial on
+    the scopex time axis. For multi-epoch acquisitions each epoch is anchored
+    at its ``duration_since_epoch_1_s`` from ``epoch_info.yaml`` (via
+    :func:`wisco_slap.meta.get.unify_epoch_times`), because the ExSum's own
+    per-trial times are anchored arbitrarily per epoch; bins spanning an
+    epoch gap therefore report a duration that includes the gap. The offsets
+    used are recorded as ``epoch_offsets_s`` in ``metadata.json``.
     """
     import wisco_slap as wis
 
@@ -616,6 +619,8 @@ def _write_dataset(
     include_overlays: bool,
 ) -> None:
     """Write ``metadata.json`` + per-DMD ``.npz`` files into ``target``."""
+
+    import wisco_slap as wis
     contract = _glutamate_channel_contract(exsum)
     provenance = _jsonable(spy.xsum.deref_h5_any("/exptSummary/provenance", exsum))
     if not isinstance(provenance, dict):
@@ -629,6 +634,15 @@ def _write_dataset(
         epochs = np.asarray(trial_table["epoch"], dtype=int).ravel()
     else:
         epochs = np.ones(n_trials, dtype=int)
+    epoch_offsets_s = wis.meta.get.epoch_offsets(subject, exp, loc, acq)
+    if epoch_offsets_s is None and int(epochs.max()) > 1:
+        raise KeyError(
+            f"{subject}/{exp}/{loc}--{acq} is multi-epoch but has no entry in "
+            "epoch_info.yaml; run wis.meta.update() first"
+        )
+    starts_s, ends_s = wis.meta.get.unify_epoch_times(
+        starts_days * 86400.0, ends_days * 86400.0, epochs, epoch_offsets_s
+    )
     bundle_id = _bundle_id(exsum, provenance, bin_trials)
     mean_images = spy.xsum.get_meanIM(exsum)
     source_maps, _ = spy.xsum.get_fp_info(exsum)
@@ -657,6 +671,16 @@ def _write_dataset(
         "n_frames_hz": float(analyze_hz),
         "bin_trials": int(bin_trials),
         "minimum_valid_trial_fraction": float(minimum_valid_trial_fraction),
+        "n_epochs": int(epochs.max()),
+        "epoch_offsets_s": (
+            None
+            if epoch_offsets_s is None
+            else {str(k): float(v) for k, v in sorted(epoch_offsets_s.items())}
+        ),
+        "time_axis": (
+            "seconds since first trial on the scopex axis; multi-epoch "
+            "acquisitions anchored per epoch by epoch_info duration_since_epoch_1_s"
+        ),
         "dmds": {},
     }
 
@@ -670,8 +694,8 @@ def _write_dataset(
     for dmd in range(1, n_dmds + 1):
         frame_counts = _per_trial_sample_counts(exsum, dmd, int(n_trials))
         chunks = _chunk_records(
-            start_seconds=starts_days * 86400.0,
-            end_seconds=ends_days * 86400.0,
+            start_seconds=starts_s,
+            end_seconds=ends_s,
             epochs=epochs,
             frame_counts=frame_counts,
             bin_trials=bin_trials,

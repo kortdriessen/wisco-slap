@@ -74,9 +74,9 @@ def single_soma_acqs(
     valid_soma_ids = [f"soma{i}" for i in range(1, 10)]
     for v in valid_acqs:
         subject, exp, loc, acq = v.split("--")
-        _hypno, acq_dur, _wake, _nrem, _rem = wis.get.acq_sleep_coverage(
-            subject, exp, loc, acq
-        )
+        # Inclusion needs acquisition duration only. acq_sleep_coverage uses
+        # this same timing value but also scores the full-block hypnogram.
+        _start, _stop, acq_dur, _sb = wis.meta.get_acq_timing(subject, exp, loc, acq)
         if acq_dur < min_duration_seconds:
             continue
 

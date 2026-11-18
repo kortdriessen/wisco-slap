@@ -240,6 +240,11 @@ def measure_dmd(
         cache_path if cache_path is not None else default_cache_path(directory, dmd)
     )
     cache = zarr.open_group(str(target), mode="r")
+    if cache.attrs.get("schema_version") != FRAME_CACHE_SCHEMA_VERSION:
+        raise ValueError(
+            "Frame cache predates the corrected dropped-trial clock; "
+            "rerun with rebuild_cache=True"
+        )
     if cache.attrs.get("bundle_id") != metadata["bundle_id"]:
         raise ValueError("Frame cache does not belong to this dataset")
     if int(cache.attrs.get("dmd", -1)) != dmd:
@@ -475,6 +480,11 @@ def measure_dataset(
         needs_build = True
         if cache_path.exists() and not rebuild_cache:
             cache = zarr.open_group(str(cache_path), mode="r")
+            if cache.attrs.get("schema_version") != FRAME_CACHE_SCHEMA_VERSION:
+                raise ValueError(
+                    "Frame cache predates the corrected dropped-trial clock; "
+                    "rerun with rebuild_cache=True"
+                )
             compatible = (
                 cache.attrs.get("bundle_id") == metadata["bundle_id"]
                 and int(cache.attrs.get("dmd", -1)) == dmd

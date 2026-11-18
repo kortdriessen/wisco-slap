@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import zarr
+
 from wisco_slap.pns import shaft_ca_gen, shaft_ca_mon
+from wisco_slap.pns._frame_timing import SHAFT_TIME_AXIS_VERSION
 
 
 def _setup(monkeypatch, tmp_path: Path, esum_name: str = "SummaryLoCo-1.mat"):
@@ -47,7 +50,9 @@ def _write_outputs(tmp_path: Path, dmds: list[int], version: str = "SummaryLoCo-
     out.mkdir(parents=True, exist_ok=True)
     fingerprints = {}
     for dmd in dmds:
-        (out / f"shaft_ca_dmd{dmd}.zarr").mkdir(exist_ok=True)
+        zarr.open_group(str(out / f"shaft_ca_dmd{dmd}.zarr"), mode="a").attrs[
+            "time_axis_version"
+        ] = SHAFT_TIME_AXIS_VERSION
         csv = shaft_ca_gen.prox_lines_csv("subj", "exp_1", "loc_A", "acq_1", dmd)
         fingerprints[dmd] = shaft_ca_gen.prox_lines_fingerprint(csv)
     shaft_ca_gen._write_markers(out, version, fingerprints)
@@ -120,6 +125,20 @@ def test_status_stale_when_exsum_version_changes(monkeypatch, tmp_path: Path) ->
     result = shaft_ca_mon.check_status("subj", "exp_1", "loc_A", "acq_1")
     assert result.status == "stale"
     assert "ExSum version" in result.details[0]
+
+
+def test_old_clock_is_stale_even_when_exsum_and_prox_lines_match(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _setup(monkeypatch, tmp_path)
+    _write_prox(tmp_path, 1)
+    out = _write_outputs(tmp_path, [1])
+    cache = zarr.open_group(str(out / "shaft_ca_dmd1.zarr"), mode="a")
+    del cache.attrs["time_axis_version"]
+    result = shaft_ca_mon.check_status("subj", "exp_1", "loc_A", "acq_1")
+    assert result.status == "stale"
+    assert result.stale_dmds == (1,)
+    assert "outdated shaft clock" in result.details[0]
 
 
 def test_acq_data_skips_fresh(monkeypatch, tmp_path: Path, capsys) -> None:

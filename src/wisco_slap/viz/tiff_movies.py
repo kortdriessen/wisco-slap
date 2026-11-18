@@ -1,635 +1,712 @@
-"""Render raw `_REGISTERED_DOWNSAMPLED-80Hz.tif` data as MP4 movies.
+"""Stream registered TIFFs to lossless display movies with authoritative ephys clocks.
 
-Given an acquisition and a time window `(t1, t2)` in the same axis that
-``wis.get.syn_dF(..., apply_ephys_offset=True)`` returns (i.e. seconds since
-sync_block-1's ephys_start, for the acq's first epoch), produce four MP4 files
-covering that window: one per `(DMD, channel)` pair.
-
-The TIFF files are per-trial: one file per `(epoch, trial, DMD)` with frames
-at 80 Hz and the two channels interleaved along the first axis as
-``[F1_C1, F1_C2, F2_C1, F2_C2, ...]``. The scopex zarrs are sampled at
-``params.analyzeHz`` (typically 200 Hz) with their time coordinate built by
-concatenating all trials without inter-trial gaps; the only gaps that appear
-are at epoch boundaries (multi-epoch acqs). Mapping ``t1, t2`` → TIFF frames
-therefore goes through a per-trial table built from the scopex time axis.
+The saved float64 frame timestamps, not the container's nominal FPS, define time.
+They use exactly the per-original-trial clock used by repaired shaft calcium.
+Movies retain every source frame; smoothing, contrast clipping and the 8-bit
+colormap are display transforms, not a replacement for quantitative raw TIFFs.
 """
 
 from __future__ import annotations
 
+import json
 import os
-import warnings
-from collections.abc import Iterator
+import shutil
+import subprocess
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+from typing import Any
 
 import av
+import h5py
 import numpy as np
-import polars as pl
 import tifffile
 import xarray as xr
+from scipy.ndimage import uniform_filter1d
 
 import slap2_py as spy
-import wisco_slap.defs as DEFS
-from wisco_slap.meta.get import ephys_offset as _get_ephys_offset
-from wisco_slap.meta.get import esum_mirror_path as _esum_mirror_path
+from wisco_slap import defs
+from wisco_slap.meta import get as meta
+from wisco_slap.pns._frame_timing import (
+    SHAFT_TIME_AXIS_VERSION,
+    fill_dropped_trial_counts,
+    scopex_frame_times,
+)
+from wisco_slap.pns.aligned_frames import (
+    per_trial_sample_counts,
+    read_channel_schema,
+    trial_epochs,
+)
 
-TIFF_FPS = 80.0  # the `_REGISTERED_DOWNSAMPLED-80Hz.tif` rate (fixed by preprocessing)
-_CHANNEL_PAIRS = (("DMD1", 1, "ch1", 0), ("DMD1", 1, "ch2", 1),
-                  ("DMD2", 2, "ch1", 0), ("DMD2", 2, "ch2", 1))
+
+@dataclass(frozen=True)
+class Trial:
+    """One real TIFF and its original trial identity and output-frame interval."""
+
+    path: str
+    trial: int
+    epoch: int
+    start: int
+    stop: int
+    n_frames: int
 
 
-# ----------------------------------------------------------------------
-# Path helpers
-# ----------------------------------------------------------------------
-def _raw_acq_dir(subject: str, exp: str, loc: str, acq: str) -> str:
-    return os.path.join(DEFS.raw_mirror_root, subject, exp, loc, acq)
+@dataclass
+class FramePlan:
+    """A DMD's complete, trial-aware frame inventory."""
+
+    dmd: int
+    trials: list[Trial]
+    times: np.ndarray
+    analyzed_counts: list[int]
+    shape: tuple[int, int]
+    n_channels: int
+    rate: float
+    segment_edges: np.ndarray
+
+
+def default_movie_dir(subject: str, exp: str, loc: str, acq: str) -> Path:
+    """Canonical full recording: ``<subject>/<exp>/movies/tiffs__<loc>--<acq>``."""
+    return Path(defs.anmat_root, subject, exp, "movies", f"tiffs__{loc}--{acq}")
 
 
 def _tiff_path(
-    subject: str, exp: str, loc: str, acq: str,
-    epoch: int, trial_one_based: int, dmd: int,
+    subject: str,
+    exp: str,
+    loc: str,
+    acq: str,
+    epoch: int,
+    trial_one_based: int,
+    dmd: int,
 ) -> str:
-    fname = f"E{epoch}T{trial_one_based}DMD{dmd}_REGISTERED_DOWNSAMPLED-80Hz.tif"
-    return os.path.join(_raw_acq_dir(subject, exp, loc, acq), fname)
-
-
-def _scopex_time_array(subject: str, exp: str, loc: str, acq: str) -> np.ndarray:
-    """Read just the scopex time coordinate (with ephys_offset applied) from
-    ``syn_dF-ls.zarr``. This is the same axis ``wis.get.syn_dF`` returns by
-    default. Reading only the ``time`` coord is fast — xarray/zarr will not
-    pull the per-synapse data."""
-    zarr_path = os.path.join(
-        DEFS.anmat_root, subject, exp, "scopex", f"{loc}--{acq}", "syn_dF-ls.zarr",
+    return str(
+        Path(
+            defs.raw_mirror_root,
+            subject,
+            exp,
+            loc,
+            acq,
+            f"E{epoch}T{trial_one_based}DMD{dmd}_REGISTERED_DOWNSAMPLED-80Hz.tif",
+        )
     )
-    if not os.path.isdir(zarr_path):
-        raise FileNotFoundError(
-            f"scopex zarr not found for {subject}/{exp}/{loc}/{acq}: {zarr_path}. "
-            f"Run wis.pns.scopex_mon.exp_data(subject, exp) first."
-        )
-    for group in ("dmd_1", "dmd_2"):
-        if os.path.isdir(os.path.join(zarr_path, group)):
-            ds = xr.open_zarr(zarr_path, group=group, consolidated=False)
-            t_internal = ds["time"].values.astype(np.float64, copy=True)
-            ds.close()
-            break
-    else:
-        raise FileNotFoundError(f"{zarr_path} contains neither dmd_1 nor dmd_2")
-    # syn_dF-ls.zarr's time coord is stored WITHOUT the ephys_offset shift;
-    # apply it here so the returned axis matches ``wis.get.syn_dF`` defaults.
-    t_internal += float(_get_ephys_offset(subject, exp, loc, acq))
-    return t_internal
 
 
-# ----------------------------------------------------------------------
-# Trial table
-# ----------------------------------------------------------------------
-def _build_trial_table(
-    subject: str, exp: str, loc: str, acq: str,
-) -> tuple[pl.DataFrame, float, np.ndarray]:
-    """Build a per-trial table with scopex sample ranges, time-axis ranges, and
-    per-trial TIFF frame counts.
+def plan_acquisition(
+    subject: str, exp: str, loc: str, acq: str
+) -> tuple[list[FramePlan], dict]:
+    """Read only metadata; validate TIFF counts against the stored Scopex clock.
 
-    Returns
-    -------
-    table : pl.DataFrame
-        Columns: ``trial_idx`` (0-based; ``trial_idx + 1`` = T# in the filename),
-        ``epoch`` (1-based; matches E# in the filename), ``scopex_sample_start``,
-        ``scopex_sample_end`` (exclusive), ``t_axis_start``, ``t_axis_end``
-        (in the scopex time axis with ephys_offset applied), ``tiff_frames``
-        (frame count at 80 Hz for this trial).
-    fs_scopex : float
-        Scopex sample rate (``params.analyzeHz`` from ExSum).
-    time_axis : np.ndarray
-        The scopex time array, with ephys_offset applied.
+    Missing TIFFs fail explicitly. Dropped analyzed trials retain their TIFFs
+    and their original Scopex placeholder duration. Cross-sync-block recordings
+    are rejected because one ephys axis cannot identify two different blocks.
     """
-    esum_path = _esum_mirror_path(subject, exp, loc, acq)
-    if esum_path in (0, "NO_ESUM_MIRROR") or not isinstance(esum_path, str):
-        raise FileNotFoundError(
-            f"ExSum mirror missing for {subject}/{exp}/{loc}/{acq}. "
-            f"Run wis.meta.update() first."
-        )
-
-    trial_epochs = spy.hf.load_any(esum_path, "/exptSummary/trialTable['epoch']")
-    trial_epochs = np.asarray(trial_epochs).squeeze().astype(int, copy=False).ravel()
-
-    analyze_hz = spy.hf.load_any(esum_path, "/exptSummary/params['analyzeHz']")
-    fs_scopex = float(np.asarray(analyze_hz).squeeze())
-
-    time_axis = _scopex_time_array(subject, exp, loc, acq)
-    n_total_scopex = int(time_axis.size)
-
-    # Probe one TIFF per epoch for its frame count (cheap — reads only headers).
-    n_trials = int(trial_epochs.size)
-    epochs_present = sorted({int(e) for e in trial_epochs})
-    frames_per_trial_by_epoch: dict[int, int] = {}
-    for e in epochs_present:
-        first_trial_in_epoch = int(np.where(trial_epochs == e)[0][0]) + 1  # 1-based
-        # DMD1 vs DMD2 will have the same frame count (synchronous acquisition).
-        probe = _tiff_path(subject, exp, loc, acq, e, first_trial_in_epoch, 1)
-        if not os.path.exists(probe):
-            probe2 = _tiff_path(subject, exp, loc, acq, e, first_trial_in_epoch, 2)
-            if not os.path.exists(probe2):
-                raise FileNotFoundError(
-                    f"No probe TIFF for epoch {e} of {subject}/{exp}/{loc}/{acq}: "
-                    f"tried {probe} and {probe2}"
-                )
-            probe = probe2
-        with tifffile.TiffFile(probe) as tf:
-            n_pages = len(tf.pages)
-        if n_pages % 2 != 0:
-            warnings.warn(
-                f"Probe TIFF {probe} has odd page count {n_pages}; expected an "
-                f"even number (two interleaved channels). Using floor-divide.",
-                stacklevel=2,
+    keys = (subject, exp, loc, acq)
+    exsum = Path(meta.esum_mirror_path(*keys))
+    with h5py.File(exsum, "r") as f:
+        n_trials = f["exptSummary/E"].shape[1]
+    epochs = trial_epochs(exsum, n_trials)
+    analyze_hz = float(
+        np.asarray(
+            spy.hf.load_any(str(exsum), "/exptSummary/params['analyzeHz']")
+        ).squeeze()
+    )
+    schema = read_channel_schema(exsum)
+    n_channels = len(schema["rawChannelNumbers"])
+    sync = meta.sync_info()[subject][exp]["acquisitions"][f"{loc}--{acq}"]
+    sync_block = int(sync["sync_block"])
+    offsets = None
+    if np.unique(epochs).tolist() != [1]:
+        epoch_info = meta.epoch_info()[subject][exp][f"{loc}--{acq}"]
+        blocks = {int(v["sync_block"]) for v in epoch_info.values()}
+        if blocks != {sync_block}:
+            raise ValueError(
+                "Movies spanning different ephys sync blocks "
+                "must be generated per block"
             )
-        frames_per_trial_by_epoch[e] = n_pages // 2
-
-    # Build per-trial rows by walking trial_epochs in order.
-    rows: list[dict] = []
-    cumulative_samples = 0
-    for trial_idx in range(n_trials):
-        e = int(trial_epochs[trial_idx])
-        frames = int(frames_per_trial_by_epoch[e])
-        samples = int(round(frames * fs_scopex / TIFF_FPS))
-        s0 = cumulative_samples
-        s1 = cumulative_samples + samples
-        # Clamp the last trial in case of off-by-a-few-samples (the SLAP2 last
-        # trial can legitimately be shorter than the canonical per-trial count).
-        if trial_idx == n_trials - 1 and s1 > n_total_scopex:
-            s1 = n_total_scopex
-        rows.append({
-            "trial_idx": trial_idx,
-            "epoch": e,
-            "scopex_sample_start": s0,
-            "scopex_sample_end": s1,
-            "tiff_frames": frames,
-        })
-        cumulative_samples = s1
-
-    # Sanity-check overall sample count.
-    discrepancy = abs(cumulative_samples - n_total_scopex)
-    if discrepancy > max(10, fs_scopex):  # allow up to a second's worth of slop
-        raise RuntimeError(
-            f"Trial-table sample accounting drifted by {discrepancy} samples for "
-            f"{subject}/{exp}/{loc}/{acq} (cumulative={cumulative_samples}, "
-            f"scopex_total={n_total_scopex}). The per-trial frame count probed "
-            f"from TIFF headers may be wrong for some epoch, or the ExSum's "
-            f"trialTable does not match the saved scopex zarr."
-        )
-
-    # Attach t_axis_start / t_axis_end from the scopex time array.
-    starts = np.array([r["scopex_sample_start"] for r in rows], dtype=np.int64)
-    ends = np.array([r["scopex_sample_end"] for r in rows], dtype=np.int64)
-    t_start = time_axis[starts]
-    # For end: time at sample (end-1) plus one sample period; use the median dt
-    # within each epoch for robustness (epoch-boundary jumps don't enter here
-    # because we only use intra-trial samples).
-    dt_scopex = 1.0 / fs_scopex
-    t_end = time_axis[ends - 1] + dt_scopex
-
-    table = pl.DataFrame({
-        "trial_idx": [r["trial_idx"] for r in rows],
-        "epoch": [r["epoch"] for r in rows],
-        "scopex_sample_start": [r["scopex_sample_start"] for r in rows],
-        "scopex_sample_end": [r["scopex_sample_end"] for r in rows],
-        "t_axis_start": t_start,
-        "t_axis_end": t_end,
-        "tiff_frames": [r["tiff_frames"] for r in rows],
-    })
-    return table, fs_scopex, time_axis
-
-
-def _select_trials_and_frames(
-    trial_table: pl.DataFrame, t1: float, t2: float,
-) -> pl.DataFrame:
-    """Filter to trials overlapping [t1, t2] and add TIFF frame slice columns.
-
-    Within each selected trial, the slice is `[tiff_frame_start, tiff_frame_end)`
-    at 80 Hz. Conversion: ``tiff_frame = round((t - t_axis_start) * 80)``,
-    clamped to ``[0, tiff_frames]``.
-    """
-    if not t2 > t1:
-        raise ValueError(f"t2 ({t2}) must be greater than t1 ({t1}).")
-
-    selected = trial_table.filter(
-        (pl.col("t_axis_end") > t1) & (pl.col("t_axis_start") < t2)
+        offsets = {
+            int(k): float(v["duration_since_epoch_1_s"]) for k, v in epoch_info.items()
+        }
+    ratio, offset = float(meta.clock_ratio(*keys)), float(meta.ephys_offset(*keys))
+    if not np.isfinite(ratio) or ratio <= 0 or not np.isfinite(offset):
+        raise ValueError("Invalid acquisition clock metadata")
+    plans = []
+    zarr = Path(
+        defs.anmat_root, subject, exp, "scopex", f"{loc}--{acq}", "syn_dF-ls.zarr"
     )
-    if selected.is_empty():
-        raise ValueError(
-            f"No trials overlap [{t1}, {t2}]. Trial-table covers "
-            f"[{trial_table['t_axis_start'].min():.3f}, "
-            f"{trial_table['t_axis_end'].max():.3f}]."
+    for dmd in (1, 2):
+        group = zarr / f"dmd_{dmd}"
+        if not group.exists():
+            continue
+        counts = per_trial_sample_counts(exsum, dmd, n_trials)
+        filled = fill_dropped_trial_counts(counts, epochs)
+        paths = [_tiff_path(*keys, int(e), t + 1, dmd) for t, e in enumerate(epochs)]
+        frame_counts, shape = [], None
+        for path in paths:
+            with tifffile.TiffFile(path) as tf:
+                npages, this_shape = len(tf.pages), tuple(tf.pages[0].shape)
+            if npages % n_channels:
+                raise ValueError(f"Incomplete interleaved channels in {path}")
+            if shape is not None and this_shape != shape:
+                raise ValueError(f"Changing spatial dimensions at {path}")
+            shape = this_shape
+            frame_counts.append(npages // n_channels)
+        internal, rate = scopex_frame_times(
+            frame_counts, counts, analyze_hz, epochs, offsets
         )
-
-    starts_s = ((np.maximum(selected["t_axis_start"].to_numpy(), t1)
-                 - selected["t_axis_start"].to_numpy()) * TIFF_FPS)
-    ends_s = ((np.minimum(selected["t_axis_end"].to_numpy(), t2)
-               - selected["t_axis_start"].to_numpy()) * TIFF_FPS)
-    n_frames_per_row = selected["tiff_frames"].to_numpy()
-
-    fstart = np.clip(np.round(starts_s).astype(np.int64), 0, n_frames_per_row)
-    fend = np.clip(np.round(ends_s).astype(np.int64), 0, n_frames_per_row)
-    # Drop rows that round to a zero-frame slice (e.g. user window touches the
-    # very tail of a trial).
-    keep = fend > fstart
-    selected = selected.with_columns(
-        pl.Series("tiff_frame_start", fstart, dtype=pl.Int64),
-        pl.Series("tiff_frame_end", fend, dtype=pl.Int64),
-    ).filter(pl.Series(keep))
-    if selected.is_empty():
-        raise ValueError(
-            f"Window [{t1}, {t2}] resolved to zero TIFF frames after rounding."
+        # Check every trial boundary against actual stored Scopex timestamps.
+        with xr.open_zarr(str(zarr), group=f"dmd_{dmd}", consolidated=False) as ds:
+            scope_times = np.asarray(ds.time.values, dtype=float)
+        if len(scope_times) != int(filled.sum()):
+            raise ValueError(f"DMD{dmd}: ExSum and Scopex trial counts disagree")
+        sample_starts = np.r_[0, np.cumsum(filled)[:-1]]
+        edges = np.r_[0, np.cumsum(frame_counts)]
+        if not np.allclose(
+            internal[edges[:-1]], scope_times[sample_starts], rtol=0, atol=1e-7
+        ):
+            raise ValueError(
+                f"DMD{dmd}: canonical TIFF and stored Scopex trial boundaries disagree"
+            )
+        times = internal / ratio + offset
+        # Smooth only inside continuous epoch runs; never through wall-clock gaps.
+        breaks = np.flatnonzero(np.diff(epochs) != 0) + 1
+        segment_edges = np.r_[0, edges[breaks], len(times)].astype(np.int64)
+        trials = [
+            Trial(p, i + 1, int(e), int(edges[i]), int(edges[i + 1]), int(n))
+            for i, (p, e, n) in enumerate(zip(paths, epochs, frame_counts, strict=True))
+        ]
+        plans.append(
+            FramePlan(
+                dmd,
+                trials,
+                times,
+                counts,
+                shape,
+                n_channels,
+                float(rate * ratio),
+                segment_edges,
+            )
         )
-    return selected
+    if not plans:
+        raise FileNotFoundError(f"No Scopex DMD data in {zarr}")
+    stat = exsum.stat()
+    provenance = dict(
+        schema_version=1,
+        timebase="ephys",
+        acquisition=dict(zip(("subject", "exp", "loc", "acq"), keys, strict=True)),
+        sync_block=sync_block,
+        clock_ratio=ratio,
+        ephys_offset_s=offset,
+        time_axis_version=SHAFT_TIME_AXIS_VERSION,
+        channel_schema=schema,
+        exsum=dict(path=str(exsum), size=stat.st_size, mtime_ns=stat.st_mtime_ns),
+        timing_method=(
+            "scopex_frame_times(frame_counts, analyzed_counts, analyze_hz, "
+            "epochs, epoch_offsets) / clock_ratio + ephys_offset"
+        ),
+        timing_limit=(
+            "Exact agreement with shaft and Scopex trial clocks; TIFF samples are "
+            "uniformly placed within each analyzed trial, not independently "
+            "measured exposure TTLs."
+        ),
+    )
+    return plans, provenance
 
 
-# ----------------------------------------------------------------------
-# TIFF loading
-# ----------------------------------------------------------------------
-def _load_trial_slice(
-    path: str, frame_start: int, frame_end: int,
+def _read(plan: FramePlan, channel: int, start: int, stop: int) -> np.ndarray:
+    """Read a bounded float32 channel slice; memory-map uncompressed TIFF pages."""
+    pieces = []
+    for trial in plan.trials:
+        if trial.stop <= start or trial.start >= stop:
+            continue
+        lo, hi = (
+            max(start, trial.start) - trial.start,
+            min(stop, trial.stop) - trial.start,
+        )
+        try:
+            raw = tifffile.memmap(trial.path, mode="r")
+            piece = raw[
+                lo * plan.n_channels + channel : hi * plan.n_channels : plan.n_channels
+            ]
+        except ValueError:
+            piece = tifffile.imread(
+                trial.path,
+                key=range(
+                    lo * plan.n_channels + channel,
+                    hi * plan.n_channels,
+                    plan.n_channels,
+                ),
+            )
+            if piece.ndim == 2:
+                piece = piece[None]
+        pieces.append(piece)
+    if not pieces:
+        raise ValueError("Empty source frame range")
+    return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
+
+
+def _packed_smooth(
+    plan: FramePlan, channel: int, start: int, stop: int, window: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Load a slice of one trial's TIFF and deinterleave the two channels.
+    """Smooth real pixels only, with full halos and no mixing across epoch gaps.
 
-    The file's first axis is `[F1_C1, F1_C2, F2_C1, F2_C2, ...]` — so frame `f`
-    of channel `c` lives at page `2*f + c`. Slicing the file in page units
-    avoids reading frames we don't need.
+    Returns (time by finite-pixel values, flattened pixel indices). Missing pixels
+    stay absent; finite-weight filtering prevents a single NaN poisoning a trace.
     """
-    page_start = 2 * int(frame_start)
-    page_end = 2 * int(frame_end)
-    data = tifffile.imread(path, key=range(page_start, page_end))
-    # tifffile returns either (n_pages, H, W) when n_pages > 1 or (H, W) when 1.
-    if data.ndim == 2:
-        data = data[None, ...]
-    ch1 = data[0::2]
-    ch2 = data[1::2]
-    return ch1, ch2
+    seg = np.searchsorted(plan.segment_edges, start, side="right") - 1
+    seg0, seg1 = plan.segment_edges[seg : seg + 2]
+    if stop > seg1:
+        raise ValueError("Smoothing chunks must not cross an epoch boundary")
+    left, right = window // 2, (window - 1) // 2
+    lo, hi = max(int(seg0), start - left), min(int(seg1), stop + right)
+    raw = _read(plan, channel, lo, hi)
+    mask = np.isfinite(raw).any(axis=0)
+    coords = np.flatnonzero(mask)
+    packed = np.asarray(raw[:, mask], dtype=np.float32)
+    if window > 1 and packed.size:
+        valid = np.isfinite(packed)
+        values = uniform_filter1d(
+            np.where(valid, packed, 0), window, axis=0, mode="nearest"
+        )
+        weights = uniform_filter1d(
+            valid.astype(np.float32), window, axis=0, mode="nearest"
+        )
+        np.divide(values, weights, out=values, where=weights > 0)
+        values[weights == 0] = np.nan
+        # A missing center pixel is still missing, regardless of neighbouring frames.
+        values[~valid] = np.nan
+        packed = values
+    return packed[start - lo : stop - lo], coords
 
 
-# ----------------------------------------------------------------------
-# Contrast / encoding
-# ----------------------------------------------------------------------
-def _percentile_contrast(
-    stack: np.ndarray, lo_pct: float, hi_pct: float, max_sample_frames: int = 200,
+def _contrast(
+    plan: FramePlan,
+    channel: int,
+    window: int,
+    pcts: tuple[float, float],
+    max_sample_frames: int = 200,
 ) -> tuple[float, float]:
-    """Return ``(vmin, vmax)`` from a subsample of frames for uint8 scaling."""
-    if stack.shape[0] > max_sample_frames:
-        rng = np.random.default_rng(seed=0)
-        idx = rng.choice(stack.shape[0], size=max_sample_frames, replace=False)
-        sample = stack[idx]
-    else:
-        sample = stack
-    lo, hi = np.nanpercentile(sample.astype(np.float64), [lo_pct, hi_pct])
-    if hi <= lo:
-        hi = lo + 1.0
-    return float(lo), float(hi)
-
-
-def _resolve_cmap(name: str | None):
-    """Look up a matplotlib colormap by name; returns ``None`` to mean grayscale."""
-    if name is None:
-        return None
-    from matplotlib import colormaps as _mpl_colormaps
-
-    return _mpl_colormaps[name]
-
-
-def _to_rgb_u8(
-    frame: np.ndarray, vmin: float, vmax: float, cmap=None,
-) -> np.ndarray:
-    """Normalize a single frame to ``[0, 1]`` then render to ``(H, W, 3)`` uint8.
-
-    ``cmap`` is either ``None`` (grayscale, replicated to three channels) or a
-    matplotlib ``Colormap`` (RGBA → RGB). NaN pixels (typically the area
-    outside the active DMD footprint in registered TIFFs) are forced to black
-    in the output regardless of the colormap, so colormaps like ``Reds`` /
-    ``Greens`` that map 0 to white don't bleed into the off-footprint region.
-    """
-    f32 = frame.astype(np.float32, copy=False)
-    nan_mask = ~np.isfinite(f32)
-    x = (f32 - vmin) / (vmax - vmin)
-    x = np.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
-    np.clip(x, 0.0, 1.0, out=x)
-    if cmap is None:
-        u8 = (x * 255.0 + 0.5).astype(np.uint8)
-        rgb = np.stack([u8, u8, u8], axis=-1)
-    else:
-        rgba = cmap(x, bytes=True)  # (H, W, 4) uint8
-        rgb = rgba[..., :3].copy()
-    if nan_mask.any():
-        rgb[nan_mask] = 0
-    return rgb
-
-
-def _apply_smoothing(stack: np.ndarray, window_frames: int) -> np.ndarray:
-    """Box-filter along the time axis (axis 0). Returns ``stack`` unchanged
-    when ``window_frames <= 1``. Operates in float32 to avoid uint16 overflow."""
-    if window_frames <= 1:
-        return stack
-    from scipy.ndimage import uniform_filter1d
-
-    return uniform_filter1d(
-        stack.astype(np.float32, copy=False),
-        size=int(window_frames),
-        axis=0,
-        mode="nearest",
+    """Original deterministic random 200-frame contrast sample, after smoothing."""
+    n = len(plan.times)
+    indexes = (
+        np.random.default_rng(0).choice(n, max_sample_frames, replace=False)
+        if n > max_sample_frames
+        else np.arange(n)
     )
+    samples = []
+    for i in np.sort(indexes):
+        values, _ = _packed_smooth(plan, channel, int(i), int(i + 1), window)
+        samples.append(values.ravel())
+    sample = np.concatenate(samples)
+    sample = sample[np.isfinite(sample)]
+    if not sample.size:
+        raise ValueError(f"DMD{plan.dmd} channel {channel + 1} has no finite pixels")
+    lo, hi = np.percentile(sample.astype(np.float64), pcts)
+    return float(lo), float(hi if hi > lo else lo + 1)
 
 
-def _stream_mp4(
-    frames_iter: Iterator[np.ndarray],
-    out_path: str,
+def _palette(name: str | None) -> np.ndarray:
+    if name is None:
+        return np.repeat(np.arange(256, dtype=np.uint8)[:, None], 3, axis=1)
+    from matplotlib import colormaps
+
+    cmap = colormaps[name]
+    return cmap(np.arange(cmap.N), bytes=True)[:, :3].copy()
+
+
+def _render_packed(
+    values: np.ndarray,
+    coords: np.ndarray,
+    shape: tuple[int, int],
+    vmin: float,
+    vmax: float,
+    palette: np.ndarray,
+    rotate_k: int,
+    grayscale: bool = False,
+) -> np.ndarray:
+    """Render one packed frame with the same 8-bit colormap lookup as Matplotlib."""
+    scaled = np.clip((values - vmin) / (vmax - vmin), 0, 1)
+    valid = np.isfinite(scaled)
+    scaled = np.nan_to_num(scaled)
+    indices = np.minimum(
+        (scaled * 255 + 0.5 if grayscale else scaled * len(palette)).astype(np.int32),
+        len(palette) - 1,
+    )
+    rgb = np.zeros((shape[0] * shape[1], 3), dtype=np.uint8)
+    rgb[coords[valid]] = palette[indices[valid]]
+    return np.ascontiguousarray(np.rot90(rgb.reshape(*shape, 3), rotate_k))
+
+
+def _encode_segment(
+    path: str,
+    plan: FramePlan,
+    channel: int,
+    start: int,
+    stop: int,
+    window: int,
+    contrast: tuple[float, float],
+    palette: np.ndarray,
+    rotate_k: int,
     fps: float,
     codec: str,
     crf: int,
-    width: int,
-    height: int,
-    n_frames: int,
-    progress: bool,
-    progress_every: int = 100,
-) -> None:
-    """Encode a stream of ``(H, W, 3)`` uint8 RGB frames to an MP4 via PyAV.
-
-    Mirrors the encoder setup pattern in ``wisco_slap.pns.synmovies`` (see
-    `wisco-slap/src/wisco_slap/pns/synmovies.py:510`); yuv420p output for
-    universal compatibility, with right/bottom zero-pad when dimensions are odd.
-    """
-    H = int(height); W = int(width)
-    H_eff = H + (H % 2)
-    W_eff = W + (W % 2)
-    pix_fmt = "yuv420p"
-    pad_needed = (H_eff != H) or (W_eff != W)
-
-    container = av.open(out_path, mode="w")
-    stream = container.add_stream(codec, rate=int(round(fps)))
-    stream.width = W_eff
-    stream.height = H_eff
-    stream.pix_fmt = pix_fmt
-
-    opts: dict[str, str] = {}
-    if codec in ("h264", "libx264"):
-        opts["crf"] = str(int(crf))
-        opts["preset"] = "veryfast"
-    elif codec == "h264_nvenc":
-        opts["cq"] = str(int(crf))
-        opts["preset"] = "p5"
-    if hasattr(stream, "codec_context") and hasattr(stream.codec_context, "options"):
-        stream.codec_context.options = opts
-
-    label = os.path.basename(out_path)
-    for i, rgb in enumerate(frames_iter):
-        if pad_needed:
-            padded = np.zeros((H_eff, W_eff, 3), dtype=np.uint8)
-            padded[:H, :W, :] = rgb
-            rgb = padded
-        video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
-        if (
-            video_frame.width != W_eff
-            or video_frame.height != H_eff
-            or video_frame.format.name != pix_fmt
-        ):
-            video_frame = video_frame.reformat(
-                width=W_eff, height=H_eff, format=pix_fmt
+    preset: str,
+    encoder_threads: int,
+    grayscale: bool,
+) -> dict:
+    t0 = time.perf_counter()
+    packed, coords = _packed_smooth(plan, channel, start, stop, window)
+    height, width = plan.shape if rotate_k % 2 == 0 else plan.shape[::-1]
+    pix_fmt = (
+        "rgb24" if codec == "libx264rgb" else ("bgr0" if codec == "ffv1" else "yuv420p")
+    )
+    if pix_fmt == "yuv420p":
+        width += width % 2
+        height += height % 2
+    with av.open(path, mode="w") as output:
+        stream = output.add_stream(
+            codec, rate=Fraction(str(fps)).limit_denominator(100000)
+        )
+        stream.width, stream.height, stream.pix_fmt = width, height, pix_fmt
+        stream.codec_context.thread_count = encoder_threads
+        if "264" in codec or "265" in codec:
+            stream.options = dict(crf=str(crf), preset=preset)
+        for i, values in enumerate(packed):
+            rgb = _render_packed(
+                values, coords, plan.shape, *contrast, palette, rotate_k, grayscale
             )
-        for packet in stream.encode(video_frame):
-            container.mux(packet)
-        if progress and ((i + 1) % progress_every == 0 or (i + 1) == n_frames):
-            print(f"[{label}] encoded {i + 1}/{n_frames}")
+            if rgb.shape[:2] != (height, width):
+                rgb = np.pad(
+                    rgb, ((0, height - rgb.shape[0]), (0, width - rgb.shape[1]), (0, 0))
+                )
+            frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            frame.pts = i
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+    return dict(path=path, n_frames=stop - start, elapsed_s=time.perf_counter() - t0)
 
-    for packet in stream.encode():  # flush
-        container.mux(packet)
-    container.close()
+
+def _concat(paths: list[str], output: Path) -> None:
+    """Remux independent keyframe segments; no decoding, re-encoding or frame loss."""
+    listing = output.with_suffix(".concat.txt")
+    listing.write_text(
+        "".join(
+            "file '" + str(Path(p).resolve()).replace("'", "'\\''") + "'\n"
+            for p in paths
+        )
+    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(listing),
+                "-map",
+                "0:v:0",
+                "-c",
+                "copy",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        listing.unlink(missing_ok=True)
 
 
-# ----------------------------------------------------------------------
-# Main entry point
-# ----------------------------------------------------------------------
 def make(
     subject: str,
     exp: str,
     loc: str,
     acq: str,
-    t1: float,
-    t2: float,
+    t1: float | None = None,
+    t2: float | None = None,
     *,
-    out_dir: str | None = None,
-    fps: float = 80.0,
+    out_dir: str | Path | None = None,
+    fps: float | None = None,
     cmaps: tuple[str | None, str | None] | None = None,
     smoothing_s: float | None = None,
     rotate_k: int = 1,
-    contrast_percentiles: (
-        tuple[float, float] | dict[str, tuple[float, float]]
-    ) = (1.0, 99.5),
-    codec: str = "h264",
-    crf: int = 18,
+    contrast_percentiles: tuple[float, float] | dict[str, tuple[float, float]] = (
+        1.0,
+        99.5,
+    ),
+    codec: str = "libx264rgb",
+    crf: int = 0,
+    preset: str = "veryfast",
+    workers: int = 8,
+    chunk_frames: int = 512,
+    encoder_threads: int = 2,
     overwrite: bool = False,
     progress: bool = True,
-) -> dict[str, str]:
-    """Render four MP4 movies of the raw 80 Hz TIFF data for the window
-    ``[t1, t2]``.
+) -> dict[str, Any]:
+    """Generate all DMD/channel movies and a Loupe-readable ``manifest.json``.
 
-    Parameters
-    ----------
-    subject, exp, loc, acq : str
-        Acquisition identifiers (e.g. ``"alnair", "exp_5", "loc_H", "acq_1"``).
-    t1, t2 : float
-        Time window in the *scopex time axis with ephys_offset applied* —
-        the same axis as ``wis.get.syn_dF(subject, exp, loc, acq)['dmd_1'].time``.
-        For multi-epoch cross-sync-block acqs this axis is anchored to
-        sync_block-1's ephys_start (see ``wis.get._get_scopex._apply_ephys_offset``).
-    out_dir : str | None
-        Directory to write the four MP4s into. Defaults to
-        ``<anmat_root>/<subject>/<exp>/viz/tiff_movies/<loc>--<acq>/t{t1:.2f}-{t2:.2f}/``.
-    fps : float
-        Playback frame rate. Default 80 (= real-time). No interpolation — this
-        only changes how fast the rendered frames are played.
-    cmaps : (str | None, str | None) | None
-        Per-channel matplotlib colormaps applied to both DMDs: ``cmaps[0]``
-        for ch1, ``cmaps[1]`` for ch2. Example: ``("Reds", "Greens")``.
-        Pass ``None`` (default) for grayscale on both channels, or e.g.
-        ``("Reds", None)`` for cmap on ch1 only.
-    smoothing_s : float | None
-        If given, apply a uniform rolling-mean over time of width
-        ``round(smoothing_s * 80)`` TIFF frames (axis 0 of each stack). Use
-        e.g. ``0.05`` for a 50 ms box filter. ``None`` (default) disables.
-        Note: smoothing crosses trial boundaries (which are contiguous in
-        scopex time) and epoch boundaries (which are NOT — there's a true
-        wall-clock gap), so windows that straddle epoch boundaries will
-        average across a real time gap.
-    rotate_k : int
-        Number of CCW 90° rotations to apply to each frame (``np.rot90``).
-        Default ``1`` orients the SLAP2 FOV with its x-axis horizontal.
-        Set to ``0`` to disable.
-    contrast_percentiles : (float, float) | dict[str, (float, float)]
-        Lower / upper percentiles for uint8 scaling. Either a single
-        ``(lo, hi)`` 2-tuple applied to every ``(DMD, channel)`` stack
-        (default ``(1.0, 99.5)``), or a dict keyed by ``"DMD1"`` / ``"DMD2"``
-        for per-DMD percentiles, e.g.
-        ``{"DMD1": (1.0, 99.5), "DMD2": (0.5, 99.9)}``. Within each DMD the
-        two channels still get their own ``(vmin, vmax)`` computed at those
-        percentiles.
-    codec : str
-        FFmpeg codec name. ``"h264"`` (libx264, default) or ``"h264_nvenc"``.
-    crf : int
-        Constant-rate-factor for libx264 (also used as ``cq`` for NVENC).
-        Default 18 ≈ visually lossless.
-    overwrite : bool
-        If False (default), refuse to clobber existing MP4s in ``out_dir``.
-    progress : bool
-        Print per-MP4 encoding progress.
+    ``t1/t2`` are inclusive/exclusive ephys seconds; both None selects the full
+    acquisition. Timestamp sidecars preserve every original TIFF sample and
+    epoch gap. The normal movie container uses nominal FPS, whereas Loupe uses
+    the exact sidecar clock. No temporal downsampling or spatial resizing occurs.
 
-    Returns
-    -------
-    dict
-        ``{"DMD1_ch1": path, "DMD1_ch2": path, "DMD2_ch1": path, "DMD2_ch2": path}``.
+    Default libx264rgb CRF 0 is pixel-exact lossless RGB encoding of the requested
+    display transform (no YUV chroma subsampling). Quantization to 256 cmap
+    entries, contrast clipping and requested temporal smoothing remain explicit
+    display losses. ``workers`` independent chunks encode concurrently, keeping
+    memory bounded rather than concatenating terabytes into acquisition arrays.
+
+    Movie and timestamp paths inside the manifest are relative to its directory,
+    so completed exports can move together. ``manifest_path`` in the returned
+    dictionary identifies the written manifest. Explicit time windows default
+    to ``clips/tSTART-END`` beneath the acquisition's movie directory.
     """
-    # Resolve contrast_percentiles into a per-DMD lookup.
-    percentiles_by_dmd: dict[str, tuple[float, float]]
-    if isinstance(contrast_percentiles, dict):
-        unknown = set(contrast_percentiles) - {"DMD1", "DMD2"}
-        if unknown:
-            raise ValueError(
-                f"contrast_percentiles dict keys must be 'DMD1' / 'DMD2', "
-                f"got unknown key(s): {sorted(unknown)}."
-            )
-        # Default any missing DMD to the original (1.0, 99.5).
-        default_pcts = (1.0, 99.5)
-        percentiles_by_dmd = {
-            "DMD1": tuple(contrast_percentiles.get("DMD1", default_pcts)),  # type: ignore[arg-type]
-            "DMD2": tuple(contrast_percentiles.get("DMD2", default_pcts)),  # type: ignore[arg-type]
-        }
-    else:
-        if len(contrast_percentiles) != 2:
-            raise ValueError(
-                f"contrast_percentiles tuple must be length 2 (lo, hi), "
-                f"got length {len(contrast_percentiles)}."
-            )
-        pct = tuple(contrast_percentiles)  # type: ignore[arg-type]
-        percentiles_by_dmd = {"DMD1": pct, "DMD2": pct}
-
-    # Validate cmaps tuple early; resolve names to matplotlib Colormap objects.
-    if cmaps is not None and len(cmaps) != 2:
+    started = time.perf_counter()
+    if workers < 1 or chunk_frames < 1 or encoder_threads < 1:
+        raise ValueError("workers, chunk_frames and encoder_threads must be positive")
+    if codec not in ("libx264rgb", "libx264", "h264", "ffv1"):
+        raise ValueError("Supported codecs: libx264rgb, libx264, h264, ffv1")
+    if not 0 <= crf <= 51:
+        raise ValueError("crf must be between 0 and 51")
+    if fps is not None and (not np.isfinite(fps) or fps <= 0):
+        raise ValueError("fps must be positive and finite")
+    if smoothing_s is not None and (not np.isfinite(smoothing_s) or smoothing_s < 0):
+        raise ValueError("smoothing_s must be nonnegative and finite")
+    names = cmaps or (None, None)
+    if len(names) != 2:
+        raise ValueError("cmaps must contain one entry for each raw channel")
+    palettes = [_palette(name) for name in names]
+    plans, manifest = plan_acquisition(subject, exp, loc, acq)
+    if any(p.n_channels != 2 for p in plans):
         raise ValueError(
-            f"cmaps must be a 2-tuple (ch1, ch2), got length {len(cmaps)}."
+            "Movie renderer currently expects two interleaved raw channels"
         )
-    cmap_ch1 = _resolve_cmap(cmaps[0]) if cmaps is not None else None
-    cmap_ch2 = _resolve_cmap(cmaps[1]) if cmaps is not None else None
-    cmap_by_key = {
-        "DMD1_ch1": cmap_ch1, "DMD2_ch1": cmap_ch1,
-        "DMD1_ch2": cmap_ch2, "DMD2_ch2": cmap_ch2,
-    }
-
-    window_frames = 0
-    if smoothing_s is not None and smoothing_s > 0:
-        window_frames = int(round(float(smoothing_s) * TIFF_FPS))
-        if window_frames <= 1:
-            window_frames = 0  # too small to matter
-
-    rotate_k = int(rotate_k) % 4
-    trial_table, _fs_scopex, _time_axis = _build_trial_table(subject, exp, loc, acq)
-    selected = _select_trials_and_frames(trial_table, t1, t2)
-
-    if out_dir is None:
-        out_dir = os.path.join(
-            DEFS.anmat_root, subject, exp, "viz", "tiff_movies",
-            f"{loc}--{acq}", f"t{t1:.2f}-{t2:.2f}",
+    first, last = (
+        min(p.times[0] for p in plans),
+        max(p.times[-1] + 1 / p.rate for p in plans),
+    )
+    lo, hi = first if t1 is None else float(t1), last if t2 is None else float(t2)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        raise ValueError("t1/t2 must define a finite increasing time window")
+    destination = (
+        Path(out_dir)
+        if out_dir is not None
+        else default_movie_dir(subject, exp, loc, acq)
+    )
+    if out_dir is None and (t1 is not None or t2 is not None):
+        destination = destination / "clips" / f"t{lo:.3f}-{hi:.3f}"
+    destination.mkdir(parents=True, exist_ok=True)
+    manifest_path = destination / "manifest.json"
+    extension = ".mkv" if codec == "ffv1" else ".mp4"
+    expected = [manifest_path] + [
+        destination / f"DMD{p.dmd}_ch{c + 1}{extension}"
+        for p in plans
+        for c in range(2)
+    ]
+    if not overwrite and any(p.exists() for p in expected):
+        raise FileExistsError(
+            f"Movies already exist in {destination}; pass overwrite=True"
         )
-    os.makedirs(out_dir, exist_ok=True)
-    out_paths = {
-        f"{dmd_label}_{ch_label}": os.path.join(out_dir, f"{dmd_label}_{ch_label}.mp4")
-        for dmd_label, _dmd, ch_label, _ch_idx in _CHANNEL_PAIRS
-    }
-    if not overwrite:
-        existing = [p for p in out_paths.values() if os.path.exists(p)]
-        if existing:
-            raise FileExistsError(
-                f"Refusing to overwrite existing MP4(s): {existing}. "
-                f"Pass overwrite=True to replace."
-            )
-
-    # Load all selected slices into per-(DMD,channel) lists. For 8s windows
-    # this is fine in memory (~640 frames × ~750×400 × uint16 × 4 channels
-    # ≈ 1.5 GB).  Missing TIFFs are deferred as ("BLACK", n_frames, dmd_label)
-    # tokens and filled with zeros once we know the spatial shape from a
-    # successfully-loaded slice.
-    per_key: dict[str, list] = {k: [] for k in out_paths}
-    shape_by_dmd: dict[str, tuple[int, int]] = {}
-    for row in selected.iter_rows(named=True):
-        epoch = int(row["epoch"])
-        trial_one_based = int(row["trial_idx"]) + 1
-        f0 = int(row["tiff_frame_start"])
-        f1 = int(row["tiff_frame_end"])
-        for dmd_label, dmd in (("DMD1", 1), ("DMD2", 2)):
-            path = _tiff_path(subject, exp, loc, acq, epoch, trial_one_based, dmd)
-            if not os.path.exists(path):
-                warnings.warn(
-                    f"Missing TIFF for epoch {epoch} trial {trial_one_based} "
-                    f"{dmd_label}: {path}. That segment will be black.",
-                    stacklevel=2,
+    stage = Path(tempfile.mkdtemp(prefix=".render-", dir=destination))
+    videos, jobs, results = [], [], {}
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            contrast_jobs = {}
+            configs = []
+            for plan in plans:
+                start, stop = np.searchsorted(plan.times, [lo, hi], side="left")
+                if start == stop:
+                    continue
+                # Subset time window still uses full source halos, so endpoints are
+                # identical to the corresponding full-recording display frames.
+                window = max(1, int(round((smoothing_s or 0) * plan.rate)))
+                pcts = (
+                    contrast_percentiles.get(f"DMD{plan.dmd}", (1.0, 99.5))
+                    if isinstance(contrast_percentiles, dict)
+                    else contrast_percentiles
                 )
-                per_key[f"{dmd_label}_ch1"].append(("BLACK", dmd_label, f1 - f0))
-                per_key[f"{dmd_label}_ch2"].append(("BLACK", dmd_label, f1 - f0))
-                continue
-            ch1, ch2 = _load_trial_slice(path, f0, f1)
-            per_key[f"{dmd_label}_ch1"].append(ch1)
-            per_key[f"{dmd_label}_ch2"].append(ch2)
-            shape_by_dmd.setdefault(dmd_label, (ch1.shape[1], ch1.shape[2]))
-
-    if not shape_by_dmd:
-        raise FileNotFoundError(
-            f"All TIFFs in window [{t1}, {t2}] for {subject}/{exp}/{loc}/{acq} "
-            f"were missing on disk."
+                if len(pcts) != 2 or not 0 <= pcts[0] < pcts[1] <= 100:
+                    raise ValueError(
+                        "Contrast percentiles must satisfy 0 <= lo < hi <= 100"
+                    )
+                for channel in range(2):
+                    key = f"DMD{plan.dmd}_ch{channel + 1}"
+                    config = (plan, channel, int(start), int(stop), window, key)
+                    configs.append(config)
+                    # Acquisition-wide contrast stays stable for short windows.
+                    contrast_jobs[
+                        pool.submit(_contrast, plan, channel, window, pcts)
+                    ] = key
+            if not configs:
+                raise ValueError("Requested interval contains no TIFF frames")
+            contrasts = {}
+            for future in as_completed(contrast_jobs):
+                key = contrast_jobs[future]
+                contrasts[key] = future.result()
+                if progress:
+                    print(f"[{key}] contrast={contrasts[key]}", flush=True)
+            for plan, channel, start, stop, window, key in configs:
+                frame_times = plan.times[start:stop]
+                np.save(stage / f"{key}.frame_times.npy", frame_times)
+                selected_trials = []
+                for trial in plan.trials:
+                    a, b = max(start, trial.start), min(stop, trial.stop)
+                    if b > a:
+                        stat = Path(trial.path).stat()
+                        selected_trials.append(
+                            dict(
+                                trial=trial.trial,
+                                epoch=trial.epoch,
+                                source_path=trial.path,
+                                source_size=stat.st_size,
+                                source_mtime_ns=stat.st_mtime_ns,
+                                source_frame_start=a - trial.start,
+                                source_frame_stop=b - trial.start,
+                                movie_frame_start=a - start,
+                                movie_frame_stop=b - start,
+                                analyzed=bool(plan.analyzed_counts[trial.trial - 1]),
+                            )
+                        )
+                signals = np.asarray(
+                    manifest["channel_schema"]["signalByRawChannel"], dtype=object
+                ).ravel()
+                video = dict(
+                    key=key,
+                    name=f"DMD{plan.dmd} {signals[channel]}",
+                    dmd=plan.dmd,
+                    channel=channel + 1,
+                    video_path=f"{key}{extension}",
+                    frame_times_path=f"{key}.frame_times.npy",
+                    n_frames=len(frame_times),
+                    frame_time_start_s=float(frame_times[0]),
+                    frame_time_end_s=float(frame_times[-1]),
+                    nominal_fps=float(fps or plan.rate),
+                    source_shape=list(plan.shape),
+                    rotate_k=rotate_k % 4,
+                    smoothing_s=smoothing_s,
+                    smoothing_frames=window,
+                    contrast=list(contrasts[key]),
+                    colormap=names[channel],
+                    trials=selected_trials,
+                    gaps_after_frame=np.flatnonzero(
+                        np.diff(frame_times) > 3 * np.median(np.diff(frame_times))
+                    ).tolist(),
+                )
+                videos.append(video)
+                boundaries = sorted({
+                    start,
+                    stop,
+                    *[int(v) for v in plan.segment_edges if start < v < stop],
+                })
+                chunks = []
+                for a, b in zip(boundaries[:-1], boundaries[1:], strict=True):
+                    chunks.extend(
+                        (i, min(i + chunk_frames, b)) for i in range(a, b, chunk_frames)
+                    )
+                paths = []
+                for number, (a, b) in enumerate(chunks):
+                    path = str(stage / f"{key}.{number:05d}{extension}")
+                    paths.append(path)
+                    args = (
+                        path,
+                        plan,
+                        channel,
+                        a,
+                        b,
+                        window,
+                        contrasts[key],
+                        palettes[channel],
+                        rotate_k % 4,
+                        float(fps or plan.rate),
+                        codec,
+                        crf,
+                        preset,
+                        encoder_threads,
+                        names[channel] is None,
+                    )
+                    jobs.append((key, number, args))
+                results[key] = paths
+            # Interleave all streams, so a short recording also uses the full pool.
+            jobs.sort(key=lambda job: job[1])
+            futures = {
+                pool.submit(_encode_segment, *args): (key, n) for key, n, args in jobs
+            }
+            done_frames = 0
+            last_print = time.perf_counter()
+            for future in as_completed(futures):
+                result = future.result()
+                done_frames += result["n_frames"]
+                now = time.perf_counter()
+                if progress and (
+                    now - last_print > 10
+                    or done_frames == sum(v["n_frames"] for v in videos)
+                ):
+                    print(
+                        f"[movies] {done_frames:,}/"
+                        f"{sum(v['n_frames'] for v in videos):,} frames; "
+                        f"{now - started:.1f}s",
+                        flush=True,
+                    )
+                    last_print = now
+        for video in videos:
+            key = video["key"]
+            target = stage / f"{key}{extension}"
+            _concat(results[key], target)
+            with av.open(str(target)) as container:
+                stream = container.streams.video[0]
+                # Packet count checks remux output without decoding every RGB pixel.
+                packet_count = sum(p.size > 0 for p in container.demux(stream))
+            if packet_count != video["n_frames"]:
+                raise RuntimeError(
+                    f"{key}: encoded {packet_count} frames, "
+                    f"expected {video['n_frames']}"
+                )
+            video["size_bytes"] = target.stat().st_size
+        manifest.update(
+            videos=videos,
+            path_convention="relative_to_manifest",
+            requested_time_window_s=[t1, t2],
+            covered_time_window_s=[lo, hi],
+            contrast_percentiles=contrast_percentiles,
+            contrast_sample_frames=200,
+            contrast_random_seed=0,
+            codec=codec,
+            crf=crf,
+            preset=preset,
+            lossless_display_encoding=codec == "ffv1"
+            or (codec == "libx264rgb" and crf == 0),
+            display_transform=(
+                "All source frames retained. Temporal finite-weight box smoothing; "
+                "independent fixed contrast; colormap lookup table; "
+                "off-footprint/missing pixels black."
+            ),
+            workers=workers,
+            chunk_frames=chunk_frames,
+            encoder_threads=encoder_threads,
+            elapsed_s=time.perf_counter() - started,
+            manifest_path=str(manifest_path.resolve()),
         )
-
-    fallback_shape = next(iter(shape_by_dmd.values()))
-
-    def _resolve(piece):
-        if isinstance(piece, tuple) and piece and piece[0] == "BLACK":
-            _, dmd_label, n = piece
-            H, W = shape_by_dmd.get(dmd_label, fallback_shape)
-            return np.zeros((n, H, W), dtype=np.uint16)
-        return piece
-
-    stacks = {
-        k: np.concatenate([_resolve(p) for p in v], axis=0)
-        for k, v in per_key.items()
-    }
-
-    # Rotate every stack (axes 1, 2 are the spatial H, W) so the SLAP2 FOV is
-    # oriented x-horizontal in the rendered MP4. After ``rot90(k=1)`` on shape
-    # ``(N, H, W)`` the new shape is ``(N, W, H)`` — i.e. height and width swap.
-    if rotate_k:
-        stacks = {k: np.rot90(s, k=rotate_k, axes=(1, 2)) for k, s in stacks.items()}
-
-    # Apply temporal smoothing BEFORE contrast — a tighter (vmin, vmax) on
-    # smoothed data gives better visible dynamic range in the MP4.
-    if window_frames:
-        if progress:
-            print(
-                f"[smoothing] uniform_filter1d size={window_frames} frames "
-                f"({window_frames / TIFF_FPS:.3f}s) along time axis"
-            )
-        stacks = {k: _apply_smoothing(s, window_frames) for k, s in stacks.items()}
-
-    # Per-key contrast → encode. Percentiles are looked up per DMD; both
-    # channels of a DMD share the percentile pair but each gets its own
-    # (vmin, vmax) computed against its own data.
-    for key, stack in stacks.items():
-        dmd_label = key.split("_", 1)[0]
-        lo_pct, hi_pct = percentiles_by_dmd[dmd_label]
-        vmin, vmax = _percentile_contrast(stack, lo_pct, hi_pct)
-        n_frames = stack.shape[0]
-        H, W = stack.shape[1], stack.shape[2]
-        cmap = cmap_by_key[key]
-        if progress:
-            cmap_label = cmap.name if cmap is not None else "gray"
-            print(
-                f"[{key}] {n_frames} frames, {W}x{H}, "
-                f"contrast=({vmin:.1f}, {vmax:.1f}), cmap={cmap_label}, "
-                f"→ {out_paths[key]}"
-            )
-        _stream_mp4(
-            (_to_rgb_u8(stack[i], vmin, vmax, cmap) for i in range(n_frames)),
-            out_paths[key], fps=fps, codec=codec, crf=crf,
-            width=W, height=H, n_frames=n_frames, progress=progress,
+        (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        for video in videos:
+            for field in ("video_path", "frame_times_path"):
+                target = destination / video[field]
+                os.replace(stage / target.name, target)
+        os.replace(stage / "manifest.json", manifest_path)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    if progress:
+        print(
+            f"[movies] ready: {manifest_path} ({manifest['elapsed_s']:.1f}s)",
+            flush=True,
         )
-
-    return out_paths
+    return manifest

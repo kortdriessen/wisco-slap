@@ -5,6 +5,7 @@ from __future__ import annotations
 import xarray as xr
 
 import wisco_slap as wis
+from wisco_slap.pns._frame_timing import SHAFT_TIME_AXIS_VERSION
 from wisco_slap.pns.shaft_ca_gen import shaft_ca_dir
 
 
@@ -35,15 +36,21 @@ def shaft_ca(
         ``{"dmd_1": Dataset, ...}`` with ``F``/``dff`` (disc x time), disc
         coords (``dendrite_id``, ``arc_um``, ``F0``, ...), and per-frame
         ``trial``/``quality`` coords.
+
+    Notes
+    -----
+    Legacy outputs with the dropped-trial clock defect are rejected. Repair
+    their coordinates with ``wis.pns.shaft_ca_gen.repair_time_coordinates``
+    (backs up timestamps and preserves fluorescence), or regenerate them.
+    ``time`` is authoritative; ``sample_rate_hz`` is the acquisition average
+    when within-trial frame rounding gives slightly varying sample intervals.
     """
 
     directory = shaft_ca_dir(subject, exp, loc, acq)
     dmds = [dmd] if dmd is not None else [1, 2]
     out: dict[str, xr.Dataset] = {}
     offset = (
-        wis.meta.get.ephys_offset(subject, exp, loc, acq)
-        if apply_ephys_offset
-        else 0.0
+        wis.meta.get.ephys_offset(subject, exp, loc, acq) if apply_ephys_offset else 0.0
     )
     for d in dmds:
         path = directory / f"shaft_ca_dmd{d}.zarr"
@@ -51,7 +58,15 @@ def shaft_ca(
             if dmd is not None:
                 raise FileNotFoundError(f"No shaft-calcium output at {path}")
             continue
-        dataset = xr.open_zarr(path).load()
+        dataset = xr.open_zarr(path)
+        if dataset.attrs.get("time_axis_version") != SHAFT_TIME_AXIS_VERSION:
+            dataset.close()
+            raise ValueError(
+                f"Outdated shaft clock at {path}; run "
+                "wis.pns.shaft_ca_gen.repair_time_coordinates"
+                f"({subject!r}, {exp!r}, {loc!r}, {acq!r}) first"
+            )
+        dataset.load()
         if apply_ephys_offset:
             # time ticks on the microscope clock (~4 ppm slow vs TDT); convert
             # to TDT seconds before anchoring, matching the scopex loaders

@@ -1898,7 +1898,7 @@ def generate_standard_synaptic_movies(
         for sid in dmd_info[subject][exp][loc][acq][f"dmd-{dmd}"]["somas"]:
             real_somas.append(sid)
 
-    h = wis.peri.anno.load_auto_hypno(subject, exp, sb, filter_unclear=0.7)
+    h = wis.peri.anno.load_auto_hypno(subject, exp, sb, filter_unclear=0.7, filter_on='raw')
 
     # load the synapse dataframe:
     syndf = wis.scope.io.load_syndf(
@@ -2084,7 +2084,7 @@ def generate_peripheral_trace_movie(
     si = wis.meta.get.sync_info()
     sb = si[subject][exp]["acquisitions"][f"{loc}--{acq}"]["sync_block"]
 
-    h = wis.peri.anno.load_auto_hypno(subject, exp, sb, filter_unclear=0.7)
+    h = wis.peri.anno.load_auto_hypno(subject, exp, sb, filter_unclear=0.7, filter_on='raw')
 
     ephys = wis.peri.ephys.load_single_ephys_block(
         subject, exp, sync_block=sb, stores=eeg_store

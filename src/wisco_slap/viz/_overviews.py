@@ -488,6 +488,9 @@ def exp_nan_plot(subject, exp, loc, acq, save=True, array=None):
     state_colors["NREM"] = (2, flex.blue600)
     state_colors["REM"] = (3, flex.magenta600)
     state_colors["Wake"] = (1, flex.green600)
+    state_colors.update({s: (1 if parent == 'Wake' else 2, wis.defs.state_colors[s])
+                         for s, parent in wis.defs.substate_parent.items()})
+    state_colors['Unscored'] = (0, '#777777')
     f, ax[0] = epy.plot.hypno.plot_basic_hypnogram(
         hacq,
         f,
@@ -498,8 +501,9 @@ def exp_nan_plot(subject, exp, loc, acq, save=True, array=None):
         state_colors=state_colors,
     )
     total_duration = dn.time.values[-1] - dn.time.values[0]
-    nrem_duration = hacq.df.filter(pl.col("state") == "NREM")["duration"].sum()
-    wake_duration = hacq.df.filter(pl.col("state") == "Wake")["duration"].sum()
+    broad_state = pl.col('state').replace(wis.defs.substate_parent)
+    nrem_duration = hacq.df.filter(broad_state == "NREM")["duration"].sum()
+    wake_duration = hacq.df.filter(broad_state == "Wake")["duration"].sum()
     rem_duration = hacq.df.filter(pl.col("state") == "REM")["duration"].sum()
     f.suptitle(
         f"{subject}, {exp}, {loc}, {acq} | Total Duration = {float(total_duration):.1f} s | "

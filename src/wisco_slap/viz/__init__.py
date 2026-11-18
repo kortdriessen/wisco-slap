@@ -3,6 +3,9 @@ from . import overview_and_summary_plots as overview_and_summary_plots
 from . import synapto_anim as synapto_anim
 from . import synapto_overlays as synapto_overlays
 from . import tiff_movies as tiff_movies
+from ._ephys_locking import superficial_dmd as superficial_dmd
+from ._ephys_locking import wave_locked_overview as wave_locked_overview
+from ._ephys_locking import wave_locked_peths as wave_locked_peths
 from ._overviews import all_soma_overview as all_soma_overview
 from .colors import two_color_cmap as two_color_cmap
 from .overview_and_summary_plots import (
@@ -17,6 +20,7 @@ from .overview_and_summary_plots import (
 from .overview_and_summary_plots import (
     single_soma_overview_plot as single_soma_overview_plot,
 )
+from .overview_and_summary_plots import single_soma_sw_locking_plot as single_soma_sw_locking_plot
 from .synapto_anim import (
     SceneConfig as SceneConfig,
 )
@@ -44,4 +48,8 @@ __all__ = [
     "acq_within_exp_plot",
     "single_soma_corr_overview_plot",
     "single_soma_overview_plot",
+    "single_soma_sw_locking_plot",
+    "superficial_dmd",
+    "wave_locked_overview",
+    "wave_locked_peths",
 ]

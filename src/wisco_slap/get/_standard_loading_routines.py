@@ -113,17 +113,30 @@ def _piped_footprints(subject, exp, loc, acq, fp_threshold=0.01):
     return mim, smap, fpvals
 
 
-def _piped_peripherals(subject, exp, loc, acq, stores=["EEG_", "loal"]):
+def _piped_peripherals(
+    subject,
+    exp,
+    loc,
+    acq,
+    stores=["EEG_", "loal"],
+    *,
+    apply_substates=True,
+    **substate_kwargs,
+):
     sb = wis.meta.sync.get_acq_sync_block(subject, exp, loc, acq)
     ephys = wis.get.ephys(subject, exp, sb, stores=stores)
     # eeg = ephys['EEG_']
     # loal = ephys['loal']
     eye = wis.get.eye_metrics(subject, exp, sb)
     whisk = wis.get.whisk_df(subject, exp, sb)
-    hypno_acq, acq_dur, frw, frn, frr = wis.get.acq_sleep_coverage(
-        subject, exp, loc, acq
+    # Score once for the full block; trimming must not recalibrate the detector.
+    hypno_full = wis.get.bout_hypno(
+        subject, exp, loc, acq, apply_substates=apply_substates, **substate_kwargs
     )
-    hypno_full = wis.get.bout_hypno(subject, exp, loc, acq)
+    if hypno_full is None:
+        raise FileNotFoundError(f"No hypnogram for {subject}/{exp}/{loc}/{acq}")
+    start, stop, acq_dur, _ = wis.meta.get_acq_timing(subject, exp, loc, acq)
+    hypno_acq = hypno_full.trim(start, stop)
     return ephys, eye, whisk, hypno_acq, hypno_full, acq_dur
 
 

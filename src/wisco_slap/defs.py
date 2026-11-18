@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 
+import fluxplot.colors as fpc
+
 # -------- Defaults (edit these) --------
 # raw data root, on the NAS
 data_root: str = (
@@ -30,6 +32,10 @@ sync_recovery_root = os.path.join(anmat_root, "sync_recovery")
 
 exsum_mirror_root = os.path.join(anmat_root, "ExSum_mirrors")
 plots_root = os.path.join(anmat_root, "plots")
+# Regenerable caches of analysis inputs/results (safe to delete; rebuilt on use).
+analysis_cache_root = os.path.join(anmat_root, "analysis_caches")
+# wis.scope.bistab: per-soma detector inputs + cohort results.
+bistab_cache_root = os.path.join(analysis_cache_root, "bistab")
 
 
 dlc_root: str = "/data/slap_analysis/slap_mi_in_the_pupil"
@@ -70,6 +76,11 @@ store_chans["loal"] = [1]
 store_chans["Wav1"] = [1]
 
 state_colors = {
+    "Active wake": "#e46b37",
+    "Quiet wake": "#ddb444",
+    "NREM SWS": "#547dad",
+    "NREM sigma": "#aa77ca",
+    "Unscored": "#777777",
     "Wake": "#62e273",
     "Brief-Arousal": "#90EE90",
     "Transition-to-NREM": "#87CEEB",
@@ -88,6 +99,14 @@ state_colors = {
     "unclear": "#FFFF00",
 }
 
+# Broad-state summaries must combine both members of each substate family.
+substate_parent = {
+    "Active wake": "Wake",
+    "Quiet wake": "Wake",
+    "NREM SWS": "NREM",
+    "NREM sigma": "NREM",
+}
+
 color_defs = {
     "whisk": "#0504aa",  # xkcd: royal blue
     "pupil": "#36013f",  # xkcd: deep purple
@@ -96,4 +115,14 @@ color_defs = {
     "glugreen": "#2ec700",
     "jred": "#d60b1f",
     "deepgray": "#212121",
+}
+
+state_color_conventions = {
+    "NREM": fpc.blue600,
+    "Wake": fpc.green600,
+    "REM": fpc.magenta600,
+    "NREM SWS": fpc.blue600,
+    "NREM sigma": "#688CBC",
+    "Active wake": fpc.green600,
+    "Quiet wake": "#8CBE52",
 }

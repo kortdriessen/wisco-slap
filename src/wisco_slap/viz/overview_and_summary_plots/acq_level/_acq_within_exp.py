@@ -65,6 +65,8 @@ SPEC_CLIP_PCT: tuple[float, float] = (1, 99)
 SPEC_CMAP = "viridis"
 #: Hypnogram shading colour per state; states not listed are not shaded.
 STATE_COLORS = {"Wake": flex.green600, "NREM": flex.blue600, "REM": flex.magenta600}
+STATE_COLORS.update({s: wis.defs.state_colors[s] for s in
+                     ['Active wake', 'Quiet wake', 'NREM SWS', 'NREM sigma']})
 HYPNO_ALPHA = 0.25
 #: Lines / bars sit at zorder 2: the shading is drawn on top so a dense trace
 #: cannot hide the state colour.

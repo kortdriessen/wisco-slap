@@ -25,6 +25,8 @@ from .single_soma import (
 )
 from .single_soma import single_soma_overview_path as single_soma_overview_path
 from .single_soma import single_soma_overview_plot as single_soma_overview_plot
+from .single_soma import single_soma_sw_locking_path as single_soma_sw_locking_path
+from .single_soma import single_soma_sw_locking_plot as single_soma_sw_locking_plot
 
 #: Plot-set name -> subpackage holding one module per plot.
 PLOT_SETS = {
@@ -60,4 +62,6 @@ __all__ = [
     "single_soma_corr_overview_plot",
     "single_soma_overview_path",
     "single_soma_overview_plot",
+    "single_soma_sw_locking_path",
+    "single_soma_sw_locking_plot",
 ]

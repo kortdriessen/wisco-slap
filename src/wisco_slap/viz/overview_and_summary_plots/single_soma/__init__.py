@@ -39,6 +39,8 @@ from ._single_soma_overview import (
 from ._single_soma_overview import (
     single_soma_overview_plot as single_soma_overview_plot,
 )
+from ._single_soma_sw_locking import single_soma_sw_locking_path as single_soma_sw_locking_path
+from ._single_soma_sw_locking import single_soma_sw_locking_plot as single_soma_sw_locking_plot
 
 __all__ = [
     "compute_single_soma_corr_differences",
@@ -52,4 +54,6 @@ __all__ = [
     "load_single_soma_data",
     "single_soma_overview_path",
     "single_soma_overview_plot",
+    "single_soma_sw_locking_path",
+    "single_soma_sw_locking_plot",
 ]

@@ -28,6 +28,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
+import tifffile
 import xarray as xr
 from matplotlib.axes import Axes
 from matplotlib.colors import LogNorm
@@ -182,8 +183,8 @@ def _crop_bbox(img: np.ndarray, buf: int) -> tuple[int, int, int, int]:
 
 def _draw_scale_bar(
     ax: Axes,
-    cmax: int,
-    rmax: int,
+    cmax: float,
+    rmax: float,
     um_per_px: float,
     scale_bar_um: float,
     color: str = "black",
@@ -222,6 +223,7 @@ def plot_synapto_overlays(
     require_dend: bool = True,
     cmap: str = "summer",
     mean_im_channel: int = 1,
+    exclusion_mask: dict[str, str | os.PathLike[str]] | None = None,
     log_vmin: float = 5.0,
     log_vmax_pct: float = 99.9,
     fp_threshold: float = 0.02,
@@ -232,9 +234,12 @@ def plot_synapto_overlays(
     style_path: str | None = None,
     save_dir: str | None = None,
     filename_template: str | None = None,
+    extra_nametag: str | None = None,
     dpi: int = 600,
     transparent: bool = True,
     overlay_alpha: float = 1.0,
+    overlay_only: bool = False,
+    force_same_scale: bool = False,
 ) -> dict[str, tuple[Figure, Axes]]:
     """Make a mean-IM + synapse-footprint overlay figure for each DMD.
 
@@ -257,6 +262,15 @@ def plot_synapto_overlays(
     mean_im_channel : int
         Channel index into ``get_meanIM(esum_p)[dmd]`` to use as the
         grayscale base. Default 1 (matches the notebook).
+    exclusion_mask : dict[str, str | os.PathLike[str]] | None
+        Optional mapping with keys ``'dmd1'`` and/or ``'dmd2'`` to napari
+        label-layer TIFF paths. Each TIFF must match its mean image's 2D
+        shape, optionally with extra zero padding on the bottom or right
+        (as when napari uses a larger shared canvas). Pixel coordinates
+        are preserved; masks are never resized. Nonzero label pixels are
+        set to NaN before percentile scaling and cropping, and hidden in
+        the footprint overlay.
+        Omitted DMDs are unchanged.
     log_vmin : float
         Lower bound for ``LogNorm`` on the mean-image grayscale.
     log_vmax_pct : float
@@ -281,21 +295,49 @@ def plot_synapto_overlays(
         ``{n_sources}``, ``{mode}`` (``'by_pos'`` or ``'fpvals'``).
         Default mirrors the notebook:
         ``"DMD{dmd}_mean_im_fp_overlay_{mode}__{n_sources}-SOURCES.png"``.
+    extra_nametag : str | None
+        Append ``__{extra_nametag}`` before the filename extension, including
+        when using a custom ``filename_template``. For example, ``'base'``
+        produces ``...__base.png``. None or an empty string adds no suffix.
     dpi : int
         Save resolution.
     transparent : bool
-        ``savefig(transparent=...)``.
+        ``savefig(transparent=...)``. Forced True for ``overlay_only``.
     overlay_alpha : float
         Alpha passed to ``ax.imshow(overlay)`` in ``color_by_pos=False`` mode.
         ``color_by_pos=True`` ignores this — its overlay is RGBA already.
+    overlay_only : bool
+        Show and save only synaptic footprints on a transparent background,
+        hiding the mean image and scale bar. With otherwise matching settings
+        (including exclusion mask, scale bar, figsize, dpi and force_same_scale),
+        the exported
+        PNG has the same dimensions and pixel alignment as the normal export.
+        ``overlay_alpha`` still applies; use a nonzero value to see footprints.
+        Use ``extra_nametag``, ``save_dir`` or ``filename_template`` to retain both
+        exports, since their default filenames are the same.
+    force_same_scale : bool
+        Use identical image-pixel magnification for both DMDs, so equal
+        physical distances and footprint sizes render at the same size.
+        Pad each cropped view symmetrically to the largest cropped width
+        and height across the two DMDs. This preserves square pixels and
+        gives both plots the same canvas dimensions with matching settings.
 
     Returns
     -------
     dict[str, tuple[Figure, Axes]]
         Mapping ``{'dmd_1': (fig, ax), 'dmd_2': (fig, ax)}``. Both keys are
         always present. If a DMD has no valid scopex synapses, the figure
-        still shows the mean image with no overlay.
+        still shows the mean image with no overlay, or is fully transparent
+        when ``overlay_only=True``.
     """
+    if exclusion_mask is not None:
+        invalid_keys = set(exclusion_mask) - {"dmd1", "dmd2"}
+        if invalid_keys:
+            raise ValueError(
+                "exclusion_mask keys must be 'dmd1' or 'dmd2'; "
+                f"got {invalid_keys!r}"
+            )
+
     if color_by_pos:
         require_dend = True
 
@@ -309,16 +351,60 @@ def plot_synapto_overlays(
     # raw traces needed. ``None`` when the acq has no synapse_labels.csv yet.
     idf = synid_labels(subject, exp, loc, acq)
 
+    images: dict[int, np.ndarray] = {}
+    exclusions: dict[int, np.ndarray | None] = {}
+    bounds: dict[int, tuple[int, int, int, int]] = {}
+    for dmd in (1, 2):
+        # Mean image (grayscale base)
+        img = mim[dmd][mean_im_channel].copy()
+        excluded = None
+        mask_key = f"dmd{dmd}"
+        if exclusion_mask is not None and mask_key in exclusion_mask:
+            labels = tifffile.imread(exclusion_mask[mask_key])
+            if labels.ndim != 2 or any(
+                mask_size < image_size
+                for mask_size, image_size in zip(labels.shape, img.shape, strict=True)
+            ):
+                raise ValueError(
+                    f"exclusion_mask[{mask_key!r}] must be a 2D TIFF "
+                    f"with shape {img.shape} or extra zero padding on the "
+                    f"bottom/right; got {labels.shape}"
+                )
+            height, width = img.shape
+            if np.any(labels[height:, :] != 0) or np.any(labels[:, width:] != 0):
+                raise ValueError(
+                    f"exclusion_mask[{mask_key!r}] has nonzero labels outside "
+                    f"the mean-image shape {img.shape}; check mask alignment"
+                )
+            labels = labels[:height, :width]
+            excluded = labels != 0
+            img = img.astype(float, copy=False)
+            img[excluded] = np.nan
+            if not np.isfinite(img).any():
+                raise ValueError(
+                    f"exclusion_mask[{mask_key!r}] leaves no finite mean-image pixels"
+                )
+        images[dmd] = img
+        exclusions[dmd] = excluded
+        bounds[dmd] = _crop_bbox(img, crop_buf_px)
+
+    shared_height = max(b[1] - b[0] for b in bounds.values())
+    shared_width = max(b[3] - b[2] for b in bounds.values())
+
     out: dict[str, tuple[Figure, Axes]] = {}
     for dmd in (1, 2):
         key = f"dmd_{dmd}"
-
-        # Mean image (grayscale base)
-        img = mim[dmd][mean_im_channel].copy()
+        img = images[dmd]
+        excluded = exclusions[dmd]
         vmax = float(np.nanpercentile(img, log_vmax_pct))
 
         f, ax = plt.subplots(1, 1, figsize=figsize)
-        ax.imshow(img, norm=LogNorm(vmin=log_vmin, vmax=vmax), cmap="gray")
+        # Keep invisible artists in the layout so tight-bbox exports retain
+        # exactly the same geometry when only the overlay is requested.
+        ax.imshow(
+            img, norm=LogNorm(vmin=log_vmin, vmax=vmax), cmap="gray",
+            alpha=0.0 if overlay_only else None,
+        )
 
         # Build overlay, if there is a synapse selection for this DMD
         n_sources = 0
@@ -338,14 +424,23 @@ def plot_synapto_overlays(
                 dend_ids = sel["dend-ID"].to_numpy()
                 norm_pos = _normalize_pos_per_dendrite(poses, dend_ids)
                 overlay = _build_pos_overlay(smap, syn_ids, norm_pos, cmap)
+                if excluded is not None:
+                    overlay[excluded] = 0.0
                 ax.imshow(overlay)
             else:
                 fpv = fpvals_all[dmd][:]
                 fpv = _mask_fpvals_to_valid(fpv, smap, syn_ids)
+                if excluded is not None:
+                    fpv[excluded] = np.nan
                 ax.imshow(fpv, cmap=cmap, alpha=overlay_alpha)
 
         # Crop and frame
-        rmin, rmax, cmin, cmax = _crop_bbox(img, crop_buf_px)
+        rmin, rmax, cmin, cmax = bounds[dmd]
+        if force_same_scale:
+            row_pad = (shared_height - (rmax - rmin)) / 2
+            col_pad = (shared_width - (cmax - cmin)) / 2
+            rmin, rmax = rmin - row_pad, rmax + row_pad
+            cmin, cmax = cmin - col_pad, cmax + col_pad
         ax.set_xlim(cmin, cmax)
         ax.set_ylim(rmax, rmin)
         ax.set_xticks([cmin, cmax])
@@ -354,9 +449,16 @@ def plot_synapto_overlays(
             top=False, right=False, bottom=False, left=False,
             labeltop=False, labelright=False, labelbottom=False, labelleft=False,
         )
+        ax.spines[:].set_visible(False)
 
         if scale_bar_um is not None:
             _draw_scale_bar(ax, cmax, rmax, um_per_px, scale_bar_um)
+
+        if overlay_only:
+            f.patch.set_alpha(0.0)
+            ax.patch.set_alpha(0.0)
+            for artist in [*ax.lines, *ax.texts]:
+                artist.set_alpha(0.0)
 
         if save_dir is not None:
             os.makedirs(save_dir, exist_ok=True)
@@ -368,9 +470,12 @@ def plot_synapto_overlays(
                 dmd=dmd, subject=subject, exp=exp, loc=loc, acq=acq,
                 n_sources=n_sources, mode=mode,
             )
+            if extra_nametag:
+                stem, extension = os.path.splitext(fname)
+                fname = f"{stem}__{extra_nametag}{extension}"
             f.savefig(
                 os.path.join(save_dir, fname),
-                dpi=dpi, bbox_inches="tight", transparent=transparent,
+                dpi=dpi, bbox_inches="tight", transparent=transparent or overlay_only,
             )
 
         out[key] = (f, ax)

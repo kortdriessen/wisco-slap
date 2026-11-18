@@ -6,9 +6,6 @@ For a single acquisition, this notebook will show the basics of how to load all 
 import wisco_slap as wis
 ```
 
-```{python}
-```
-
 # Define acquisition
 
 the below cell defines the information you need to get basically all other information, the subject name, experiment name, location name, and acquisition name
@@ -182,6 +179,18 @@ ephys, eye, whisk, hypno_acq, hypno_full, acq_dur = wis.get.fetch_data_pipe(
     acq=acq,
     stores=['EEG_', 'loal']
 )
+```
+
+```{python}
+hypno_full = wis.get.bout_hypno(subject, exp, loc, acq, apply_substates=True)
+```
+
+```{python}
+hypno_full
+```
+
+```{python}
+hypno_full.df['state'].unique()
 ```
 
 you may want to dice up the hypnogram into discrete bouts of uniform duration, and then add a large amount of context to each bout. You can get the contextualized diced hypnogram (ctx_hypno) using the following:

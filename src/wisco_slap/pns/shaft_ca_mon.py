@@ -13,7 +13,8 @@ channel-fix trust cutoff
 - ``shaft_ca_dmd{d}.zarr`` exists;
 - the ``shaft_ca__<ExSum-version>.txt`` marker matches the current mirror;
 - the ``shaft_ca__prox_lines_dmd{d}.txt`` marker matches the current CSV's
-  content hash.
+  content hash;
+- the dataset's ``time_axis_version`` includes the dropped-trial clock fix.
 
 This is deliberately NOT part of scopex_mon's all-or-nothing group: the
 scopex outputs share one expensive ExSum trial-data load, while shaft-ca
@@ -26,12 +27,14 @@ Public API mirrors the other monitors: :func:`check_status` (read-only),
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
 
 import wisco_slap as wis
 from wisco_slap.pns import shaft_ca_gen
+from wisco_slap.pns._frame_timing import SHAFT_TIME_AXIS_VERSION
 
 
 @dataclass(frozen=True)
@@ -41,8 +44,8 @@ class ShaftCaCheckResult:
     ``status`` is one of:
 
     - ``"fresh"`` — every DMD with prox lines has a current output;
-    - ``"stale"`` — outputs exist but the ExSum version or a prox_lines
-      fingerprint changed;
+    - ``"stale"`` — outputs exist but the ExSum version, a prox_lines
+      fingerprint, or the timestamp schema is outdated;
     - ``"missing"`` — at least one DMD with prox lines has no output;
     - ``"no_prox_lines"`` — no DMD has a usable prox_lines CSV (absent,
       present but without unique dend-IDs on every line, or saved before
@@ -114,6 +117,17 @@ def check_status(subject: str, exp: str, loc: str, acq: str) -> ShaftCaCheckResu
         if not marker.is_file() or marker.read_text().strip() != current:
             stale.append(dmd)
             details.append(f"dmd{dmd}: prox_lines changed since generation")
+            continue
+        try:
+            attrs = json.loads((zarr_path / ".zattrs").read_text())
+        except (OSError, ValueError):
+            attrs = {}
+        if attrs.get("time_axis_version") != SHAFT_TIME_AXIS_VERSION:
+            stale.append(dmd)
+            details.append(
+                f"dmd{dmd}: outdated shaft clock; run "
+                "wis.pns.shaft_ca_gen.repair_time_coordinates(...) or regenerate"
+            )
 
     if stale:
         status = "stale"

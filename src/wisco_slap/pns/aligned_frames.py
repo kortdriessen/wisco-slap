@@ -38,8 +38,9 @@ from scipy.ndimage import map_coordinates
 
 import slap2_py as spy
 from wisco_slap import defs
+from wisco_slap.pns._frame_timing import estimate_frame_rate
 
-FRAME_CACHE_SCHEMA_VERSION = 1
+FRAME_CACHE_SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +522,22 @@ def build_frame_cache(
     trial_table = spy.xsum.deref_h5_any("/exptSummary/trialTable", exsum)
     filenames = np.asarray(trial_table["fnRegDS"], dtype=object)
     sidecars = np.asarray(trial_table["fnAdata"], dtype=object)
-    starts = np.asarray(trial_table["trialStartTimeInferred"], dtype=float).ravel()
+    from wisco_slap.meta import get as _meta_get
+
+    epochs_per_trial = trial_epochs(exsum, total_trials)
+    starts_seconds, _ = _meta_get.unify_epoch_times(
+        np.asarray(trial_table["trialStartTimeInferred"], dtype=float).ravel()
+        * 86400.0,
+        np.asarray(trial_table["trialStartTimeInferred"], dtype=float).ravel()
+        * 86400.0,
+        epochs_per_trial,
+        _meta_get.epoch_offsets(
+            str(context.acquisition.get("subject", "")),
+            str(context.acquisition.get("experiment", "")),
+            str(context.acquisition.get("location", "")),
+            str(context.acquisition.get("acquisition", "")),
+        ),
+    )
     offsets = np.asarray(
         spy.xsum.deref_h5_any(
             f"/exptSummary/perTrialAlignmentOffsets[{dmd - 1}][0]", exsum
@@ -534,17 +550,19 @@ def build_frame_cache(
         for t in range(use_trials)
     ]
     total_frames = int(sum(frame_counts))
-    analyze_frames = sum(per_trial_sample_counts(exsum, dmd, total_trials))
-    all_tiff_frames = (
-        total_frames
-        if use_trials == total_trials
-        else int(round(total_frames / max(1, use_trials) * total_trials))
+    analyzed_counts = per_trial_sample_counts(exsum, dmd, total_trials)
+    sample_rate_hz = estimate_frame_rate(
+        context.analyze_hz, frame_counts, analyzed_counts[:use_trials]
     )
-    sample_rate_hz = context.analyze_hz * all_tiff_frames / max(1, analyze_frames)
 
     resume_from = 0
     if target.exists() and not overwrite:
         root = zarr.open_group(str(target), mode="a")
+        if root.attrs.get("schema_version") != FRAME_CACHE_SCHEMA_VERSION:
+            raise ValueError(
+                "Frame cache predates the corrected dropped-trial clock; "
+                "pass overwrite=True to rebuild it"
+            )
         if root.attrs.get("bundle_id") != context.identity:
             raise ValueError("Existing frame cache belongs to a different dataset")
         if int(root.attrs.get("dmd", -1)) != dmd:
@@ -613,7 +631,6 @@ def build_frame_cache(
     trial_frame_index = root["trial_frame_index"]
     time_seconds = root["time_seconds"]
     cursor = int(sum(frame_counts[:resume_from]))
-    time_origin = starts[0]
     remaining = list(range(resume_from, use_trials))
 
     def _write_trial(trial_zero: int, sampled: np.ndarray) -> None:
@@ -635,7 +652,7 @@ def build_frame_cache(
         quality[destination] = valid
         trial_index[destination] = trial_zero + 1
         trial_frame_index[destination] = np.arange(expected, dtype=np.int32)
-        trial_start_seconds = float((starts[trial_zero] - time_origin) * 86400)
+        trial_start_seconds = float(starts_seconds[trial_zero])
         time_seconds[destination] = (
             trial_start_seconds + np.arange(expected) / sample_rate_hz
         )
@@ -705,6 +722,10 @@ def validate_frame_cache(
 
     exsum = context.exsum_path
     cache = zarr.open_group(str(Path(cache_path)), mode="r")
+    if cache.attrs.get("schema_version") != FRAME_CACHE_SCHEMA_VERSION:
+        raise ValueError(
+            "Frame cache predates the corrected dropped-trial clock; rebuild it"
+        )
     if cache.attrs.get("bundle_id") != context.identity:
         raise ValueError("Frame cache does not belong to this acquisition context")
     if int(cache.attrs.get("dmd", -1)) != int(dmd):

@@ -11,5 +11,6 @@ from . import (
 from . import (
     vid as vid,
 )
+from .anno import load_auto_hypno as load_auto_hypno
 
-__all__ = ["ephys", "vid", "anno"]
+__all__ = ["ephys", "vid", "anno", "load_auto_hypno"]

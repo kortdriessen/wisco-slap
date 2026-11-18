@@ -439,7 +439,7 @@ def _state_fractions(hypno, t0: float, t1: float) -> dict[str, float]:
     total = t1 - t0
     starts = hypno.df["start_time"].to_numpy()
     ends = hypno.df["end_time"].to_numpy()
-    states = hypno.df["state"].to_numpy()
+    states = hypno.df["state"].replace(wis.defs.substate_parent).to_numpy()
     overlap = np.clip(np.minimum(ends, t1) - np.maximum(starts, t0), 0, None)
     fr = {s: float(overlap[states == s].sum() / total) for s in STAT_STATES}
     fr["other"] = float(overlap[~np.isin(states, STAT_STATES)].sum() / total)

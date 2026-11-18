@@ -2,6 +2,10 @@
 # MAIN FUNCTIONS FOR WORKING WITH DATA ANNOTATIONS (see SeeQt package for annotation software)
 # ====================================================================================
 
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -9,6 +13,19 @@ import xarray as xr
 
 import electro_py as epy
 import wisco_slap.defs as DEFS
+
+from ._hypno_substates import (
+    ActiveWakeConfig,
+    NremSigmaConfig,
+    WakeMergeConfig,
+    label_hypnogram_substates,
+)
+from ._hypno_substates import (
+    merge_labels as _merge_labels,
+)
+from ._hypno_substates import (
+    normalize_hypnogram as _normalize_hypnogram,
+)
 
 
 def load_annotation_csv(path: str, reformat: bool = True) -> pd.DataFrame:
@@ -37,40 +54,217 @@ def load_annotation_csv(path: str, reformat: bool = True) -> pd.DataFrame:
 
 
 def load_auto_hypno(
-    subject,
-    exp,
-    sync_block,
-    filter_unclear: bool = None,
-    filter_on="smooth",
-    rename=True,
-):
-    hypno_dir = f"{DEFS.anmat_root}/{subject}/{exp}/scoring_data/sync_block-{sync_block}/hypnograms/model_labelled"
-    hypno_name = "raw_epochs.csv"
-    epoch_df = pd.read_csv(f"{hypno_dir}/{hypno_name}")
-    if filter_unclear is not None:
-        if filter_on == "smooth":
-            epoch_df["label"] = epoch_df["label"].mask(
-                epoch_df[["NREM_smooth", "REM_smooth", "Wake_smooth"]].max(axis=1)
-                < filter_unclear,
-                "unclear",
-            )
-        elif filter_on == "raw":
-            epoch_df["label"] = epoch_df["label"].mask(
-                epoch_df[["P_NREM", "P_REM", "P_Wake"]].max(axis=1) < filter_unclear,
-                "unclear",
-            )
-        else:
-            raise ValueError(f"Invalid filter_on: {filter_on}")
-    epoch_df = epy.hypno.utils.merge_consecutive_labels(epoch_df)
-    if rename:
-        epoch_df = epoch_df.rename(columns={"label": "state"})
-        epoch_df = epoch_df.rename(
-            columns={"start_s": "start_time", "end_s": "end_time"}
+    subject: str,
+    exp: str,
+    sync_block: int,
+    filter_unclear: float | None = None,
+    filter_on: str = "smooth",
+    rename: bool = True,
+    *,
+    apply_substates: bool = True,
+    step1_config: ActiveWakeConfig | Mapping[str, Any] | None = None,
+    step2_config: WakeMergeConfig | Mapping[str, Any] | None = None,
+    step3_config: NremSigmaConfig | Mapping[str, Any] | None = None,
+    grid_origin_s: float | None = None,
+    window_s: float = 4.0,
+    nrem_window_s: float = 4.0,
+    eye_likelihood_min: float = 0.75,
+    return_details: bool = False,
+) -> pd.DataFrame | dict[str, Any]:
+    """Load a whole-block auto hypnogram, applying all three substates by default.
+
+    Reads current ``sync_block_data/.../hypnograms/model_scored/bout_hypno.csv``
+    (the same broad labels used in the tuners), with the old
+    ``scoring_data/.../hypnograms/model_labelled/raw_epochs.csv`` as a fallback.
+    Manual/validated annotations are never selected or overwritten here.
+
+    ``apply_substates=False`` returns original broad labels and does not load
+    EEG or video. Otherwise EEG is required; missing eye/whisk files are allowed.
+    No load-cell data, microscope offsets, notebook code, GUI, or cached labels
+    are involved. Calibration uses the entire sync block. Missing EEG files
+    raise an error; use the explicit opt-out to load broad labels without EEG.
+
+    All detector parameters are exposed via the three configuration objects or
+    partial dicts; see :func:`label_hypnogram_substates`. ``return_details=True``
+    returns its audit dict plus ``table`` in the requested legacy output format.
+
+    By default the output remains a pandas DataFrame with
+    ``start_time, end_time, state, duration``. ``rename=False`` returns
+    ``start_s, end_s, label``. Provenance/settings are in ``table.attrs``.
+    Final state names: Active wake, Quiet wake, NREM SWS, NREM sigma, REM;
+    original other labels are preserved and unannotated EEG is Unscored.
+
+    ``filter_unclear`` is opt-in and applied before subsetting. Legacy files
+    support smooth/raw confidence; current files have only raw ``P_*`` scores,
+    so use ``filter_on='raw'`` when requesting a confidence filter on them.
+    """
+    original, origin, provenance = _load_auto_hypno_source(
+        subject, exp, sync_block, filter_unclear, filter_on
+    )
+    if apply_substates:
+        from wisco_slap.get._get_sync_block_dat import ephys
+
+        from .vid import load_eye_metric_df, load_whisking_df
+
+        eeg = ephys(subject, exp, sync_block, stores=("EEG_",))["EEG_"]
+        try:
+            eye = load_eye_metric_df(subject, exp, sync_block)
+        except FileNotFoundError:
+            eye = None
+        try:
+            whisk = load_whisking_df(subject, exp, sync_block)
+        except FileNotFoundError:
+            whisk = None
+        result = label_hypnogram_substates(
+            original,
+            eeg,
+            eye,
+            whisk,
+            step1_config=step1_config,
+            step2_config=step2_config,
+            step3_config=step3_config,
+            grid_origin_s=origin if grid_origin_s is None else grid_origin_s,
+            window_s=window_s,
+            nrem_window_s=nrem_window_s,
+            eye_likelihood_min=eye_likelihood_min,
+            return_details=True,
         )
-        epoch_df["duration"] = epoch_df["end_time"] - epoch_df["start_time"]
-        epoch_df = epoch_df.sort_values(by="start_time")
-        epoch_df = epoch_df.reset_index(drop=True)
-    return epoch_df
+        frame = result["bouts"].select("start_s", "end_s", "label")
+        result["metadata"] = {**result["metadata"], **provenance}
+    else:
+        frame = _merge_labels(original)
+        result = dict(
+            original=original,
+            metadata=provenance,
+            hypnogram=epy.hypno.Hypnogram(
+                frame.rename({
+                    "start_s": "start_time",
+                    "end_s": "end_time",
+                    "label": "state",
+                })
+            ),
+        )
+    if rename:
+        frame = frame.rename({
+            "start_s": "start_time",
+            "end_s": "end_time",
+            "label": "state",
+        }).with_columns((pl.col("end_time") - pl.col("start_time")).alias("duration"))
+    table = frame.to_pandas()
+    table.attrs["substate_metadata"] = {
+        **result["metadata"],
+        "apply_substates": apply_substates,
+    }
+    return dict(**result, table=table) if return_details else table
+
+
+def _load_auto_hypno_source(
+    subject: str,
+    exp: str,
+    sync_block: int,
+    filter_unclear: float | None,
+    filter_on: str,
+) -> tuple[pl.DataFrame, float, dict]:
+    """Read the broad source without recursively calling any public loader."""
+    if filter_unclear is not None and (
+        not np.isfinite(filter_unclear) or not 0 <= filter_unclear <= 1
+    ):
+        raise ValueError("filter_unclear must be a probability threshold in [0, 1].")
+    if filter_unclear is not None and filter_on not in {"smooth", "raw"}:
+        raise ValueError(f"Invalid filter_on: {filter_on}")
+    root = Path(DEFS.anmat_root) / subject / exp
+    current = (
+        root
+        / "sync_block_data"
+        / f"sync_block-{sync_block}"
+        / "hypnograms"
+        / "model_scored"
+    )
+    legacy = (
+        root
+        / "scoring_data"
+        / f"sync_block-{sync_block}"
+        / "hypnograms"
+        / "model_labelled"
+        / "raw_epochs.csv"
+    )
+    source = current / "bout_hypno.csv"
+    if source.exists():
+        broad = _normalize_hypnogram(pl.read_csv(source))
+        epoch_path = current / "epoch_df.parquet"
+        epochs = pl.read_parquet(epoch_path) if epoch_path.exists() else None
+        layout = "model_scored_bouts"
+    elif (current / "bout_df.parquet").exists():
+        source = current / "bout_df.parquet"
+        broad = _normalize_hypnogram(pl.read_parquet(source))
+        epoch_path = current / "epoch_df.parquet"
+        epochs = pl.read_parquet(epoch_path) if epoch_path.exists() else None
+        layout = "model_scored_bouts"
+    elif legacy.exists():
+        source = legacy
+        epochs = pl.read_csv(source)
+        broad = _normalize_hypnogram(epochs)
+        epoch_path = source
+        layout = "legacy_model_labelled"
+    else:
+        raise FileNotFoundError(
+            f"No auto hypnogram for {subject}/{exp} sync block {sync_block}: "
+            f"checked {source}, {current / 'bout_df.parquet'}, and {legacy}"
+        )
+    origin = float(
+        epochs["start_s"].min() if epochs is not None else broad["start_s"][0]
+    )
+    if filter_unclear is not None:
+        columns = (
+            ["NREM_smooth", "REM_smooth", "Wake_smooth"]
+            if filter_on == "smooth"
+            else ["P_NREM", "P_REM", "P_Wake"]
+        )
+        if epochs is None or not set(columns) <= set(epochs.columns):
+            raise ValueError(
+                f"{layout} has no {filter_on} confidence columns. "
+                "For current model outputs use filter_on='raw', or filter_unclear=None."
+            )
+        low = epochs.filter(pl.max_horizontal(columns) < filter_unclear).select(
+            "start_s", "end_s"
+        )
+        if low.height:
+            # Split at confidence boundaries without replacing the HSMM labels
+            # with the raw epoch argmax predictions or filling annotation gaps.
+            edges = np.unique(
+                np.r_[broad["start_s"], broad["end_s"], low["start_s"], low["end_s"]]
+            )
+            centers = (edges[:-1] + edges[1:]) / 2
+            i = np.searchsorted(broad["start_s"].to_numpy(), centers, side="right") - 1
+            covered = (i >= 0) & (centers < broad["end_s"].to_numpy()[np.maximum(i, 0)])
+            low = low.sort("start_s")
+            j = np.searchsorted(low["start_s"].to_numpy(), centers, side="right") - 1
+            unclear = (j >= 0) & (centers < low["end_s"].to_numpy()[np.maximum(j, 0)])
+            labels = np.where(
+                unclear, "unclear", broad["label"].to_numpy()[np.maximum(i, 0)]
+            )
+            broad = pl.DataFrame(
+                dict(
+                    start_s=edges[:-1][covered],
+                    end_s=edges[1:][covered],
+                    label=labels[covered],
+                )
+            )
+    return (
+        _merge_labels(broad),
+        origin,
+        dict(
+            subject=subject,
+            exp=exp,
+            sync_block=int(sync_block),
+            source_path=str(source),
+            source_layout=layout,
+            source_mtime_ns=source.stat().st_mtime_ns,
+            epoch_source_path=str(epoch_path) if epochs is not None else None,
+            filter_unclear=filter_unclear,
+            filter_on=filter_on,
+        ),
+    )
 
 
 def load_manual_hypno(
@@ -302,9 +496,7 @@ def add_peripheral_context_to_hypno(
       ``since_last_{state}_end``, ``until_next_{state}_start``.
     """
     if hypno.time_kind is not epy.hypno.TimeKind.FLOAT:
-        raise ValueError(
-            "hypno must be float-time (seconds); call .as_float() first."
-        )
+        raise ValueError("hypno must be float-time (seconds); call .as_float() first.")
     ref = hypno if state_ref is None else state_ref
     if ref.time_kind is not epy.hypno.TimeKind.FLOAT:
         raise ValueError("state_ref must be float-time (seconds).")
@@ -323,25 +515,29 @@ def add_peripheral_context_to_hypno(
 
     total = pl.sum_horizontal([pl.col(b) for b in bands])
     hypno = epy.hypno.Hypnogram(
-        hypno.df.with_columns(total.alias("bp_total"))
-        .with_columns(
-            [(pl.col(b) / pl.col("bp_total")).alias(f"{b}_rel") for b in bands]
-        )
-        .with_columns(
-            [
-                (pl.col(num) / pl.col(den)).alias(f"{num}_over_{den}")
-                for num, den in ratios
-                if num in bands and den in bands
-            ]
-        )
+        hypno.df
+        .with_columns(total.alias("bp_total"))
+        .with_columns([
+            (pl.col(b) / pl.col("bp_total")).alias(f"{b}_rel") for b in bands
+        ])
+        .with_columns([
+            (pl.col(num) / pl.col(den)).alias(f"{num}_over_{den}")
+            for num, den in ratios
+            if num in bands and den in bands
+        ])
     )
     if norm_state is not None:
-        if norm_state not in ref.states:
+        norm_states = [
+            s
+            for s in ref.states
+            if s == norm_state or DEFS.substate_parent.get(s) == norm_state
+        ]
+        if not norm_states:
             raise ValueError(
                 f"norm_state {norm_state!r} not in state_ref states {ref.states}"
             )
         t_bp_all = np.asarray(bp["time"].values, dtype=float)
-        in_norm = ref.mask_times_by_state(t_bp_all, [norm_state])
+        in_norm = ref.mask_times_by_state(t_bp_all, norm_states)
         norm_cols = []
         for b in bands:
             ref_med = float(
@@ -349,27 +545,21 @@ def add_peripheral_context_to_hypno(
             )
             norm_cols.append((pl.col(b) / ref_med).alias(f"{b}_norm"))
         hypno = epy.hypno.Hypnogram(
-            hypno.df.with_columns(norm_cols).with_columns(
-                [
-                    (pl.col(f"{num}_norm") / pl.col(f"{den}_norm")).alias(
-                        f"{num}_over_{den}_norm"
-                    )
-                    for num, den in ratios
-                    if num in bands and den in bands
-                ]
-            )
+            hypno.df.with_columns(norm_cols).with_columns([
+                (pl.col(f"{num}_norm") / pl.col(f"{den}_norm")).alias(
+                    f"{num}_over_{den}_norm"
+                )
+                for num, den in ratios
+                if num in bands and den in bands
+            ])
         )
     hypno = epy.hypno.utils.add_elapsed_columns(hypno)
 
     # ---- 1b. imaging validity per bout ------------------------------------
     if validity_mask is not None:
         vm = validity_mask
-        if not (
-            isinstance(vm, xr.DataArray) and vm.ndim == 1 and "time" in vm.coords
-        ):
-            raise TypeError(
-                "validity_mask must be a 1-D DataArray with a 'time' coord"
-            )
+        if not (isinstance(vm, xr.DataArray) and vm.ndim == 1 and "time" in vm.coords):
+            raise TypeError("validity_mask must be a 1-D DataArray with a 'time' coord")
         hypno = _per_bout_stats(
             hypno,
             vm["time"].values,
@@ -411,7 +601,12 @@ def add_peripheral_context_to_hypno(
     t_bp = np.asarray(bp["time"].values, dtype=float)
     swa = np.asarray(bp[swa_band].values, dtype=float)
     step = float(bp.attrs.get("step_sec", np.median(np.diff(t_bp))))
-    in_state = ref.mask_times_by_state(t_bp, [swa_state])
+    swa_states = [
+        s
+        for s in ref.states
+        if s == swa_state or DEFS.substate_parent.get(s) == swa_state
+    ]
+    in_state = ref.mask_times_by_state(t_bp, swa_states)
     scored = ref.covers_time(t_bp)
     starts = hypno.df["start_time"].to_numpy()
 

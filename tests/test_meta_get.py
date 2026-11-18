@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
+
 import pytest
 
 import wisco_slap.meta.acq_types._classifications as meta_classifications
@@ -200,3 +202,41 @@ def test_valid_acquisitions_requires_the_classification_file(
 
     with pytest.raises(FileNotFoundError, match="require_baseline_valid=False"):
         meta_get.valid_acquisitions()
+
+
+# ---------------------------------------------------------------------------
+# unify_epoch_times (multi-epoch time axis)
+# ---------------------------------------------------------------------------
+
+
+def test_unify_epoch_times_single_epoch_only_shifts_origin() -> None:
+    from wisco_slap.meta.get import unify_epoch_times
+
+    starts = np.array([100.0, 110.0, 120.5])
+    ends = starts + 10.0
+    new_starts, new_ends = unify_epoch_times(starts, ends, np.ones(3, dtype=int), None)
+    assert np.allclose(new_starts, [0.0, 10.0, 20.5])
+    assert np.allclose(new_ends - new_starts, 10.0)
+
+
+def test_unify_epoch_times_reanchors_each_epoch_and_keeps_spacing() -> None:
+    from wisco_slap.meta.get import unify_epoch_times
+
+    # epoch 2 is anchored *before* epoch 1 in the raw table (the real failure mode)
+    starts = np.array([0.0, 10.0, 20.0, -500.0, -490.0])
+    ends = starts + 9.5
+    epochs = np.array([1, 1, 1, 2, 2])
+    new_starts, new_ends = unify_epoch_times(starts, ends, epochs, {1: 0.0, 2: 60.0})
+    assert np.allclose(new_starts, [0.0, 10.0, 20.0, 60.0, 70.0])
+    assert np.allclose(new_ends - new_starts, 9.5)
+    assert np.all(np.diff(new_starts) > 0)
+
+
+def test_unify_epoch_times_rejects_missing_offsets() -> None:
+    from wisco_slap.meta.get import unify_epoch_times
+
+    starts = np.array([0.0, 10.0])
+    with pytest.raises(ValueError, match="epoch_offsets_s is required"):
+        unify_epoch_times(starts, starts + 1, np.array([1, 2]), None)
+    with pytest.raises(KeyError, match="epochs \\[2\\]"):
+        unify_epoch_times(starts, starts + 1, np.array([1, 2]), {1: 0.0})

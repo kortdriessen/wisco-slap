@@ -3,22 +3,36 @@ import xarray as xr
 
 
 def combine_scopex_arrays(sxs: dict[str, xr.DataArray]) -> xr.DataArray:
-    """Combine multiple scopexrays into one, adding a 'dmd' coordinate, and renaming the syn_id coordinate to include the dmd."""
+    """Combine per-DMD scopex arrays into one array along ``syn_id``.
 
-    # make a dmd coordinate (equal to 1) on syn_id dimension:
-    sxs["dmd_1"] = sxs["dmd_1"].assign_coords(
-        dmd=("syn_id", np.ones(sxs["dmd_1"].sizes["syn_id"], dtype=int))
-    )
-    sxs["dmd_2"] = sxs["dmd_2"].assign_coords(
-        dmd=("syn_id", np.ones(sxs["dmd_2"].sizes["syn_id"], dtype=int) * 2)
-    )
-    for dmd in [1, 2]:
-        new_ids = []
-        sids = sxs[f"dmd_{dmd}"]["syn_id"].values
-        for sid in sids:
-            new_ids.append(f"{dmd}-{sid}")
-        sxs[f"dmd_{dmd}"] = sxs[f"dmd_{dmd}"].assign_coords(syn_id=new_ids)
-    mfs = xr.concat([sxs["dmd_1"], sxs["dmd_2"]], dim="syn_id")
+    Parameters
+    ----------
+    sxs : dict[str, xr.DataArray]
+        Mapping of ``"dmd_<n>"`` keys (as returned by :func:`wisco_slap.get.syn_dF`
+        and friends) to arrays with a ``syn_id`` dimension. Any subset of DMDs is
+        accepted, so acquisitions or selections that only have one DMD work too.
+
+    Returns
+    -------
+    xr.DataArray
+        Concatenated along ``syn_id`` in ascending DMD order, with a ``dmd``
+        coordinate on ``syn_id``, ``syn_id`` renamed to ``"<dmd>-<id>"`` and an
+        integer ``syn_id_number`` coordinate holding the original id.
+    """
+
+    if not sxs:
+        raise ValueError("combine_scopex_arrays received no arrays")
+    dmds = sorted(int(key.split("_")[1]) for key in sxs)
+    pieces = []
+    for dmd in dmds:
+        array = sxs[f"dmd_{dmd}"]
+        sids = array["syn_id"].values
+        pieces.append(
+            array.assign_coords(
+                dmd=("syn_id", np.full(array.sizes["syn_id"], dmd, dtype=int)),
+                syn_id=[f"{dmd}-{sid}" for sid in sids],
+            )
+        )
+    mfs = pieces[0] if len(pieces) == 1 else xr.concat(pieces, dim="syn_id")
     syn_id_numbers = [int(x.split("-")[1]) for x in mfs["syn_id"].values]
-    mfs = mfs.assign_coords(syn_id_number=("syn_id", syn_id_numbers))
-    return mfs
+    return mfs.assign_coords(syn_id_number=("syn_id", syn_id_numbers))

@@ -148,6 +148,84 @@ def epoch_info():
     return ei or {}
 
 
+def epoch_offsets(subject: str, exp: str, loc: str, acq: str) -> dict[int, float] | None:
+    """Scopex-convention epoch time offsets for one acquisition.
+
+    Returns ``{epoch: duration_since_epoch_1_s}`` from ``epoch_info.yaml`` — the
+    FPGA-derived anchors that put every epoch on the unified microscope time
+    axis used by the scopex loaders — or ``None`` when the acquisition has no
+    entry, i.e. it is single-epoch (single-epoch acquisitions are intentionally
+    absent from ``epoch_info.yaml``).
+    """
+    try:
+        acq_info = epoch_info()[subject][exp][f"{loc}--{acq}"]
+    except KeyError:
+        return None
+    return {int(k): float(v["duration_since_epoch_1_s"]) for k, v in acq_info.items()}
+
+
+def unify_epoch_times(
+    starts_s: np.ndarray,
+    ends_s: np.ndarray,
+    epochs: np.ndarray,
+    epoch_offsets_s: dict[int, float] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Put per-trial ExperimentSummary times on the unified (scopex) time axis.
+
+    The ExSum trial table's ``trialStartTimeInferred`` / ``trialEndTimeFromPC``
+    are monotonic *within* an epoch, but for multi-epoch acquisitions each
+    epoch is anchored arbitrarily (bellatrix/exp_7 loc_K--acq_1: epoch 2
+    "starts" 155 s before epoch 1 ends), so the raw values cannot be compared
+    across epochs. This re-anchors each epoch so that its earliest trial
+    starts at ``epoch_offsets_s[epoch]`` (see :func:`epoch_offsets`) while
+    preserving the within-epoch spacing and trial durations.
+
+    Parameters
+    ----------
+    starts_s, ends_s : np.ndarray
+        Per-trial start / end times in seconds on any per-epoch axis.
+    epochs : np.ndarray
+        1-based epoch number per trial.
+    epoch_offsets_s : dict[int, float] | None
+        ``{epoch: seconds since epoch 1}``. ``None`` is only valid for
+        single-epoch input.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Re-anchored starts and ends, in seconds since the first trial of
+        epoch 1. Single-epoch input comes back re-referenced to its first
+        trial's start and otherwise unchanged.
+    """
+    starts = np.asarray(starts_s, dtype=float).ravel()
+    ends = np.asarray(ends_s, dtype=float).ravel()
+    epochs = np.asarray(epochs, dtype=int).ravel()
+    if not (len(starts) == len(ends) == len(epochs)):
+        raise ValueError("starts_s, ends_s and epochs must have equal lengths")
+    if len(starts) == 0:
+        return starts.copy(), ends.copy()
+    present = [int(e) for e in np.unique(epochs)]
+    if epoch_offsets_s is None:
+        if len(present) > 1:
+            raise ValueError(
+                f"trials span epochs {present}; epoch_offsets_s is required "
+                "(run wis.meta.update() to populate epoch_info.yaml)"
+            )
+        origin = float(starts.min())
+        return starts - origin, ends - origin
+    missing = [e for e in present if e not in epoch_offsets_s]
+    if missing:
+        raise KeyError(f"epoch_offsets_s has no entry for epochs {missing}")
+    new_starts = np.empty_like(starts)
+    new_ends = np.empty_like(ends)
+    for epoch in present:
+        idx = np.flatnonzero(epochs == epoch)
+        anchor = float(starts[idx].min())
+        new_starts[idx] = float(epoch_offsets_s[epoch]) + (starts[idx] - anchor)
+        new_ends[idx] = float(epoch_offsets_s[epoch]) + (ends[idx] - anchor)
+    return new_starts, new_ends
+
+
 # ==================================================================================
 # 2. prepro info
 # ==================================================================================
